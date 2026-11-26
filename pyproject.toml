@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "alpha-fdtd"
+version = "0.1.0"
+description = "BF16 FDTD (lossy Yee, closed PEC box) for large domains on 1 to 8 NVIDIA GPUs"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "SPINS Photonics Inc." }]
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/spinsphotonics/alpha-fdtd"
+Issues = "https://github.com/spinsphotonics/alpha-fdtd/issues"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+wheel.packages = ["python/alpha_fdtd"]
+wheel.py-api = "py3"                    # pure ctypes: one wheel for every Python 3
+install.components = ["python"]
+sdist.exclude = ["build*", "**/__pycache__"]
+
+[tool.scikit-build.cmake.define]
+AFDTD_BUILD_TESTS = "OFF"
+AFDTD_BUILD_TOOLS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+markers = ["gpu: needs a supported NVIDIA GPU (alpha_fdtd.Plan works)", "gpu2: needs 2 or more supported GPUs"]

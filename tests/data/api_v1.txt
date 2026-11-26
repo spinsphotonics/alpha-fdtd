@@ -1,0 +1,69 @@
+AFDTD_API_VERSION 1
+AFDTD_VERSION_MAJOR 0
+AFDTD_VERSION_MINOR 1
+AFDTD_VERSION_PATCH 0
+AFDTD_OK 0
+AFDTD_EINVAL -1
+AFDTD_ENOMEM -2
+AFDTD_ENOPLAN -3
+AFDTD_EUNSUPPORTED -4
+AFDTD_EDEVICE -5
+AFDTD_EWALLS -6
+AFDTD_EIO -7
+AFDTD_EINTERNAL -8
+AFDTD_ESTIMATE 0
+AFDTD_MEASURE 1
+AFDTD_PATIENT 2
+AFDTD_WISDOM_ONLY 3
+AFDTD_FORCE_HOST 256
+AFDTD_STRICT_WALLS 512
+AFDTD_EX 0
+AFDTD_EY 1
+AFDTD_EZ 2
+AFDTD_HX 3
+AFDTD_HY 4
+AFDTD_HZ 5
+AFDTD_CAX 6
+AFDTD_CAY 7
+AFDTD_CAZ 8
+AFDTD_CBX 9
+AFDTD_CBY 10
+AFDTD_CBZ 11
+AFDTD_NCOMP 12
+AFDTD_BF16 1
+AFDTD_F32 2
+AFDTD_BOX_STRIDED 1
+afdtd_array size 40
+afdtd_array.data offset 0
+afdtd_array.dtype offset 8
+afdtd_array.stride offset 16
+afdtd_box size 536
+afdtd_box.offset offset 0
+afdtd_box.shape offset 24
+afdtd_box.flags offset 48
+afdtd_box.array offset 56
+afdtd_options size 32
+afdtd_options.ngpus offset 0
+afdtd_options.devices offset 8
+afdtd_options.host_bytes offset 16
+afdtd_options.rigor offset 24
+afdtd_options.flags offset 28
+afdtd_info size 152
+afdtd_info.nx offset 0
+afdtd_info.ny offset 8
+afdtd_info.nz offset 16
+afdtd_info.ngpus offset 24
+afdtd_info.devices offset 28
+afdtd_info.on_host offset 60
+afdtd_info.rigor offset 64
+afdtd_info.from_wisdom offset 68
+afdtd_info.io_block_y offset 72
+afdtd_info.gpu_bytes_used offset 80
+afdtd_info.host_bytes_used offset 88
+afdtd_info.steps_done offset 96
+afdtd_info.tail_steps offset 104
+afdtd_info.walls_zeroed_coef offset 112
+afdtd_info.walls_zeroed_field offset 120
+afdtd_info.predicted_rate offset 128
+afdtd_info.measured_rate offset 136
+afdtd_info.last_rate offset 144
