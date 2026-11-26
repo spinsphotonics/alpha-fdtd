@@ -29,6 +29,50 @@ static inline uint16_t f32_to_bf16(uint32_t u)       // round to nearest, ties t
   if ((u & 0x7FFFFFFFu) > 0x7F800000u) return (uint16_t)((u >> 16) | 0x0040u);
   return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
+uint16_t f32_to_f16(uint32_t u)                       // IEEE half: round to nearest, ties to even; overflow to inf; NaN quiet
+{
+  const uint32_t s = (u >> 16) & 0x8000u, a = u & 0x7FFFFFFFu;
+  if (a > 0x7F800000u) return (uint16_t)(s | 0x7E00u | ((a >> 13) & 0x3FFu));
+  if (a >= 0x477FF000u) return (uint16_t)(s | 0x7C00u);                  // >= 65520 (the tie above 65504 rounds to even: inf)
+  if (a >= 0x38800000u) {                                                  // normal half
+    const uint32_t r = a - 0x38000000u, rem = r & 0x1FFFu; uint32_t m = r >> 13;
+    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) ++m;
+    return (uint16_t)(s | m);
+  }
+  if (a < 0x33000000u) return (uint16_t)s;                                // below 2^-25: +-0
+  const uint32_t e = a >> 23, mant = (a & 0x7FFFFFu) | 0x800000u, sh = 126 - e;   // subnormal half: mant * 2^(e - 150) / 2^-24
+  uint32_t m = mant >> sh; const uint32_t rem = mant & ((1u << sh) - 1u), half = 1u << (sh - 1);
+  if (rem > half || (rem == half && (m & 1u))) ++m;
+  return (uint16_t)(s | m);
+}
+uint32_t f16_to_f32(uint16_t h)                        // exact
+{
+  const uint32_t s = (uint32_t)(h & 0x8000u) << 16; uint32_t e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+  if (e == 0x1F) return s | 0x7F800000u | (m << 13);
+  if (e == 0) { if (!m) return s; int k = 0; while (!(m & 0x400u)) { m <<= 1; ++k; } return s | ((uint32_t)(113 - k) << 23) | ((m & 0x3FFu) << 13); }
+  return s | ((e + 112) << 23) | (m << 13);
+}
+// the state's bit pattern (16 or 32 bits) from a caller element, and back
+static inline uint32_t to_state(int prec, int dtype, const void* data, int64_t e)
+{
+  uint32_t f;                                          // the value as float32 bits
+  if (dtype == AFDTD_F32) memcpy(&f, static_cast<const char*>(data) + 4 * e, 4);
+  else {
+    const uint16_t v = static_cast<const uint16_t*>(data)[e];
+    if (dtype == prec) return v;
+    f = dtype == AFDTD_BF16 ? (uint32_t)v << 16 : f16_to_f32(v);
+  }
+  return prec == AFDTD_F32 ? f : prec == AFDTD_BF16 ? f32_to_bf16(f) : f32_to_f16(f);
+}
+static inline void from_state(int prec, int dtype, void* data, int64_t e, uint32_t v)
+{
+  if (dtype == prec && dtype != AFDTD_F32) { static_cast<uint16_t*>(data)[e] = (uint16_t)v; return; }
+  const uint32_t f = prec == AFDTD_F32 ? v : prec == AFDTD_BF16 ? v << 16 : f16_to_f32((uint16_t)v);
+  if (dtype == AFDTD_F32) memcpy(static_cast<char*>(data) + 4 * e, &f, 4);
+  else static_cast<uint16_t*>(data)[e] = dtype == AFDTD_BF16 ? f32_to_bf16(f) : f32_to_f16(f);
+}
+static inline float state_float(int prec, uint32_t v)
+{ const uint32_t f = prec == AFDTD_F32 ? v : prec == AFDTD_BF16 ? v << 16 : f16_to_f32((uint16_t)v); float x; memcpy(&x, &f, 4); return x; }
 static inline bool on_wall(int c, int64_t x, int64_t y, int64_t z)   // tangential E, Ca, Cb on a lower wall (alpha_fdtd.h section 2)
 {
   if (c >= 3 && c < 6) return false;
@@ -40,18 +84,31 @@ static inline int64_t elem(const BoxSpec& b, int c, int64_t i, int64_t j, int64_
   if (b.flags & AFDTD_BOX_STRIDED) return i * b.a[c].stride[0] + j * b.a[c].stride[1] + k * b.a[c].stride[2];
   return (i * b.shape[1] + j) * b.shape[2] + k;
 }
-static inline uint16_t read_bits(const BoxSpec& b, int c, int64_t e)
-{
-  if (b.a[c].dtype == AFDTD_BF16) return static_cast<const uint16_t*>(b.a[c].data)[e];
-  uint32_t u; memcpy(&u, static_cast<const char*>(b.a[c].data) + 4 * e, 4); return f32_to_bf16(u);
-}
-static inline void write_bits(const BoxSpec& b, int c, int64_t e, uint16_t v)
-{
-  if (b.a[c].dtype == AFDTD_BF16) static_cast<uint16_t*>(b.a[c].data)[e] = v;
-  else { const uint32_t u = (uint32_t)v << 16; memcpy(static_cast<char*>(b.a[c].data) + 4 * e, &u, 4); }
-}
+
 
 // ------------------------------------------------------------------------------------------------ host-resident domain
+// Pinned host memory for copies at the full host-link rate: 2 MiB-aligned anonymous memory with transparent huge pages,
+// touched, then registered, as for a host-memory domain.
+void* pinned_alloc(size_t bytes)
+{
+  const size_t A = (size_t)2 << 20, len = rup(bytes, A) + A;
+  char* m = (char*)mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (m == MAP_FAILED) return nullptr;
+  char* p = (char*)(((uintptr_t)m + sizeof(size_t) * 2 + A - 1) / A * A);     // room before p for the mapping's start and length
+  if (p - m < (ptrdiff_t)(2 * sizeof(size_t))) p += A;
+  madvise(p, rup(bytes, A), MADV_HUGEPAGE);
+  parallel_for((int64_t)((bytes + 4095) / 4096), [&](int64_t a, int64_t b) { for (int64_t i = a; i < b; ++i) p[i * 4096] = 0; });
+  if (cudaHostRegister(p, rup(bytes, 4096), cudaHostRegisterPortable) != cudaSuccess) { cudaGetLastError(); munmap(m, len); return nullptr; }
+  reinterpret_cast<size_t*>(p)[-1] = len; reinterpret_cast<char**>(p)[-2] = m;
+  return p;
+}
+void pinned_free(void* q) noexcept
+{
+  if (!q) return;
+  char* p = (char*)q; const size_t len = reinterpret_cast<size_t*>(p)[-1]; char* m = reinterpret_cast<char**>(p)[-2];
+  cudaHostUnregister(p); munmap(m, len);
+}
+
 void host_alloc(HostDomain& h)
 {
   const size_t tot = h.bytes;
@@ -126,7 +183,8 @@ void box_io(Plan& p, const BoxSpec& b, int dir)
   for (int c = 0; c < 12; ++c) {
     if (!b.a[c].data) continue;
     ++nc;
-    if (b.a[c].dtype != AFDTD_BF16 && b.a[c].dtype != AFDTD_F32) fail(AFDTD_EINVAL, "%s: dtype %d is not AFDTD_BF16 (1) or AFDTD_F32 (2)", kName[c], b.a[c].dtype);
+    if (b.a[c].dtype != AFDTD_BF16 && b.a[c].dtype != AFDTD_F32 && b.a[c].dtype != AFDTD_F16)
+      fail(AFDTD_EINVAL, "%s: dtype %d is not AFDTD_BF16 (1), AFDTD_F32 (2) or AFDTD_F16 (3)", kName[c], b.a[c].dtype);
     if (b.flags & AFDTD_BOX_STRIDED)
       for (int a = 0; a < 3; ++a) {
         if (b.a[c].stride[a] < 0) fail(AFDTD_EINVAL, "%s: negative stride %lld", kName[c], (long long)b.a[c].stride[a]);
@@ -135,6 +193,8 @@ void box_io(Plan& p, const BoxSpec& b, int dir)
   }
   if (!nc) fail(AFDTD_EINVAL, "the box gives no array (every data pointer is NULL)");
   const int64_t sx = b.shape[0], sy = b.shape[1], sz = b.shape[2], x0 = b.off[0], y0 = b.off[1], z0 = b.off[2];
+  const int prec = p.prec; const uint32_t nosign = prec == AFDTD_F32 ? 0x7FFFFFFFu : 0x7FFFu;
+  auto rd = [&](int c, int64_t e) { return to_state(prec, b.a[c].dtype, b.a[c].data, e); };
   // ---- lower walls: count (and under STRICT_WALLS refuse) before anything is written
   uint64_t wc = 0, wf = 0; int64_t first[4] = {-1, 0, 0, 0};
   if (dir == 0 && (x0 == 0 || y0 == 0 || z0 == 0))
@@ -148,34 +208,35 @@ void box_io(Plan& p, const BoxSpec& b, int dir)
           bool earlier = false;                        // counted on a wall w2 < w already
           for (int w2 = 0; w2 < w; ++w2) if (w2 != c % 3 && pos[w2] == 0) earlier = true;
           if (earlier) continue;
-          const uint16_t v = read_bits(b, c, elem(b, c, i, j, k));
+          const uint32_t v = rd(c, elem(b, c, i, j, k));
           if (c >= 6) { wc += v != 0; continue; }
-          if ((v & 0x7FFFu) == 0) continue;
+          if ((v & nosign) == 0) continue;
           if (!wf++) { first[0] = c; first[1] = pos[0]; first[2] = pos[1]; first[3] = pos[2]; }
         }
       }
     }
   if (wf && (p.flags & AFDTD_STRICT_WALLS)) {
-    const uint16_t v = read_bits(b, (int)first[0], elem(b, (int)first[0], first[1] - x0, first[2] - y0, first[3] - z0));
-    uint32_t u = (uint32_t)v << 16; float f; memcpy(&f, &u, 4);
+    const float f = state_float(prec, rd((int)first[0], elem(b, (int)first[0], first[1] - x0, first[2] - y0, first[3] - z0)));
     fail(AFDTD_EWALLS, "AFDTD_STRICT_WALLS: %llu E value(s) on the lower walls are not 0 (first: %s = %g at (%lld, %lld, %lld)); index 0 is the PEC wall, "
          "put fields at index >= 1; nothing was written", (unsigned long long)wf, kName[first[0]], f, (long long)first[1], (long long)first[2], (long long)first[3]);
   }
-  // ---- copy in slabs of x planes through a dense BF16 staging buffer
-  const size_t plane = (size_t)sy * sz;
-  const int64_t xs = std::max<int64_t>(1, (int64_t)(((size_t)256 << 20) / (2 * plane * nc)));
-  std::vector<uint16_t> stage((size_t)std::min(xs, sx) * plane * nc);
+  // ---- copy in slabs of x planes through a dense staging buffer of the state's element type (16 or 32 bits)
+  const size_t plane = (size_t)sy * sz, es = prec == AFDTD_F32 ? 4 : 2;
+  const int64_t xs = std::max<int64_t>(1, (int64_t)(((size_t)256 << 20) / (es * plane * nc)));
+  std::vector<uint32_t> stage(((size_t)std::min(xs, sx) * plane * nc * es + 3) / 4);
+  auto put = [&](char* base, size_t i, uint32_t v) { if (es == 4) reinterpret_cast<uint32_t*>(base)[i] = v; else reinterpret_cast<uint16_t*>(base)[i] = (uint16_t)v; };
+  auto get = [&](const char* base, size_t i) -> uint32_t { return es == 4 ? reinterpret_cast<const uint32_t*>(base)[i] : reinterpret_cast<const uint16_t*>(base)[i]; };
   for (int64_t xa = 0; xa < sx; xa += xs) {
     const int64_t xb = std::min(sx, xa + xs); const size_t cnt = (size_t)(xb - xa) * plane;
-    uint16_t* comp[12]; int i = 0;
-    for (int c = 0; c < 12; ++c) comp[c] = b.a[c].data ? stage.data() + cnt * i++ : nullptr;
+    uint16_t* comp[12]; char* cb[12]; int i = 0;
+    for (int c = 0; c < 12; ++c) { cb[c] = b.a[c].data ? reinterpret_cast<char*>(stage.data()) + cnt * es * i++ : nullptr; comp[c] = reinterpret_cast<uint16_t*>(cb[c]); }
     const int64_t off[3] = {x0 + xa, y0, z0}, shp[3] = {xb - xa, sy, sz};
     if (dir == 0)
       parallel_for(xb - xa, [&](int64_t a, int64_t e) {
-        for (int c = 0; c < 12; ++c) if (comp[c])
+        for (int c = 0; c < 12; ++c) if (cb[c])
           for (int64_t ii = a; ii < e; ++ii) for (int64_t j = 0; j < sy; ++j) {
-            uint16_t* d = comp[c] + ((size_t)ii * sy + j) * sz;
-            for (int64_t k = 0; k < sz; ++k) d[k] = on_wall(c, x0 + xa + ii, y0 + j, z0 + k) ? 0 : read_bits(b, c, elem(b, c, xa + ii, j, k));
+            const size_t d = ((size_t)ii * sy + j) * sz;
+            for (int64_t k = 0; k < sz; ++k) put(cb[c], d + k, on_wall(c, x0 + xa + ii, y0 + j, z0 + k) ? 0u : rd(c, elem(b, c, xa + ii, j, k)));
           }
       });
     if (!p.on_host) p.obj->box(p.mem, off, shp, comp, dir);
@@ -195,10 +256,10 @@ void box_io(Plan& p, const BoxSpec& b, int dir)
       });
     if (dir == 1)
       parallel_for(xb - xa, [&](int64_t a, int64_t e) {
-        for (int c = 0; c < 12; ++c) if (comp[c])
+        for (int c = 0; c < 12; ++c) if (cb[c])
           for (int64_t ii = a; ii < e; ++ii) for (int64_t j = 0; j < sy; ++j) {
-            const uint16_t* s = comp[c] + ((size_t)ii * sy + j) * sz;
-            for (int64_t k = 0; k < sz; ++k) write_bits(b, c, elem(b, c, xa + ii, j, k), s[k]);
+            const size_t d = ((size_t)ii * sy + j) * sz;
+            for (int64_t k = 0; k < sz; ++k) from_state(prec, b.a[c].dtype, b.a[c].data, elem(b, c, xa + ii, j, k), get(cb[c], d + k));
           }
       });
   }

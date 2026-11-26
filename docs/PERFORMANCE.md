@@ -26,3 +26,7 @@ for `execute` calls of at least `7 qmax` steps. Shorter calls are bound by the h
   long enough to keep the ring full runs close to the GPU-memory rate; a shorter call is bound by the link.
 - **Planning.** `measure` times each candidate for about one second, twice, so planning a large domain takes tens of
   seconds. A wisdom record makes later plans of the same problem instant.
+- **Recording and sources.** A recorder's frames are copied by the copy engines inside the launches, so they cost no SM
+  time, and a healthy host link barely slows the kernel. The steps wait only when a frame takes longer than about one
+  pass to cross the host link, or when the sink is slower than the frames. A source keeps one SM out of the persistent
+  grid while it is active. `docs/RECORDING.md` has the limits.

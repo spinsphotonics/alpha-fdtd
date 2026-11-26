@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 // object.cu -- everything that touches one generated kernel text.  CMake compiles this file once per (kernel text, architecture)
 // with -DKERN="kernels/<name>.cuh" -DAFDTD_NS=<namespace> -DAFDTD_ARCH="sm_XX" -DAFDTD_CC=<10 major + minor>; each copy lives in its
-// own namespace and exports one afdtd::Object.
+// own namespace and exports one afdtd::Object.  With -DAFDTD_FP16 the same text runs in IEEE half precision (the state's 16-bit values
+// are FP16 bit patterns; every operation is the FP16 one), else in BF16.
 //
 //   in GPU memory   1 GPU: plain allocations, one persistent launch per <= 256 trips.  2..8 GPUs: one virtual window over the
 //                   devices (y stripes, the seams read through peer mappings), one persistent launch per device.
 //   in host memory  the helix: a ring of rows on the GPUs, each row loaded once per round, advanced Q trips, written back.
 //   tail            steps % 7 single steps with the reference formula on the same layout (exact for every split of the steps).
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "internal.hpp"
@@ -15,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -37,7 +40,13 @@ namespace AFDTD_NS {
 
 using afdtd::Geo; using afdtd::Knobs; using afdtd::HostDomain; using afdtd::rup; using afdtd::kGR; using afdtd::fail;
 typedef unsigned long long U64;
+#ifdef AFDTD_FP16
+typedef __half GT;
+#define AFDTD_PREC_CODE 3            /* AFDTD_F16 */
+#else
 typedef __nv_bfloat16 GT;
+#define AFDTD_PREC_CODE 1            /* AFDTD_BF16 */
+#endif
 #define CK AF_CK
 #define CU AF_CU
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -130,8 +139,13 @@ __global__ void esum_k(Geo G, const unsigned* buf, U64* sum, int y0, int nys)
 // neighbours in absent rows read +0, so only rows with both neighbour rows present are exact.  One thread per record (an x pair at
 // one (y, z)); the H kernel writes only H words and reads only E words of other records (E kernel: the converse): no race.
 struct TailGeo { int nx, ny, nz; long ROWREC, PLREC; size_t PS, crow; int Jb0, Jlo, Jhi; };
+#ifdef AFDTD_FP16
+__device__ __forceinline__ GT tl_bf(unsigned short b) { return __ushort_as_half(b); }
+__device__ __forceinline__ unsigned short tl_bits(GT v) { return __half_as_ushort(v); }
+#else
 __device__ __forceinline__ GT tl_bf(unsigned short b) { return __ushort_as_bfloat16(b); }
 __device__ __forceinline__ unsigned short tl_bits(GT v) { return __bfloat16_as_ushort(v); }
+#endif
 __device__ __forceinline__ GT tl_h(unsigned w, int h) { return tl_bf((unsigned short)((w >> (16 * h)) & 0xFFFFu)); }
 __device__ __forceinline__ bool tl_rec(const TailGeo& G, int Ja, size_t t, int& J, int& l, int& z, int& x0, int& y, size_t& r, size_t& cofs)
 {
@@ -273,6 +287,10 @@ struct Mem {
   std::vector<int> J0, sr; size_t RSB = 0, FB = 0, CRSB = 0, CFB = 0, YHB = 0, XPB = 0, PGB = 0;
   CUdeviceptr base = 0, aux = 0, yhb = 0, xpb = 0, pgb = 0; int GAPX = 0, GAPY = 0, SSTX = 0, SSTY = 0; long PST = 0; Vmm state, pools;
   std::vector<Dev> L; int cur_passes = -1; Knobs cur_k; std::vector<U64*> dsum; unsigned short* stage = nullptr; size_t stage_cap = 0;
+  // agents: one non-blocking stream and one seam event per GPU, a pinned array of DONE words, each pass's block order per GPU
+  std::vector<cudaStream_t> ast; std::vector<cudaEvent_t> aev; unsigned* hdone = nullptr; size_t hdone_n = 0;
+  std::vector<cudaStream_t> mst;     // the persistent launches: non-blocking, so legacy-stream work elsewhere does not wait for them
+  std::vector<std::vector<int>> posv; std::vector<int> nppv; bool patched = false;
   size_t crow() const { return multi ? CRSB : CROW; }
   unsigned char* coe() const { return multi ? reinterpret_cast<unsigned char*>(base + FB) : COE; }
   unsigned* fld() const { return multi ? reinterpret_cast<unsigned*>(base) : FLD; }
@@ -321,7 +339,7 @@ static void alloc_multi(Mem& s)
   for (int g = 0; g < NG; ++g) if (s.J0[g + 1] <= s.J0[g]) fail(-1, "ny = %d is too small for %d GPUs", G.ny, NG);
   s.sr.assign(G.NJ + 1, 0); for (int g = 0; g < NG; ++g) for (int J = s.J0[g]; J < s.J0[g + 1]; ++J) s.sr[J] = g; s.sr[G.NJ] = NG - 1;
   s.GAPX = (int)((kGR + G.XBUF - 1) / G.XBUF); s.GAPY = (int)((kGR + G.YBUF - 1) / G.YBUF);
-  s.PST = (long)rup((size_t)max_npp(s) * afdtd::kPMAX + 64, (size_t)1 << 19);
+  s.PST = (long)rup((size_t)2 * max_npp(s) * afdtd::kPMAX + 64, (size_t)1 << 19);      // blocks, DONE word, agent words
   CU(afdtd::drv().MemAddressReserve(&s.base, s.FB + s.CFB, 0, 0, 0));
   s.state.map_by(s.base, s.FB, [&](size_t off) { return s.devs[s.sr[off / s.RSB]]; });
   s.state.map_by(s.base + s.FB, s.CFB, [&](size_t off) { return s.devs[s.sr[off / s.CRSB]]; });
@@ -338,7 +356,7 @@ static void upload_tables(Mem& s, Dev& l)
   CK(cudaMemcpy(l.dord, l.ord.data(), l.ord.size() * sizeof(int), cudaMemcpyHostToDevice));
   if (l.tim_cap < (size_t)l.nb * 16) { if (l.dtim) CK(cudaFree(l.dtim)); l.dtim = nullptr; CK(cudaMalloc(&l.dtim, (size_t)l.nb * 16 * sizeof(long long))); l.tim_cap = (size_t)l.nb * 16; }
   if (!l.dtick) CK(cudaMalloc(&l.dtick, 64));
-  if (!s.multi && s.prog_cap < (size_t)l.nb + 64) { if (s.prog) CK(cudaFree(s.prog)); s.prog = nullptr; CK(cudaMalloc(&s.prog, ((size_t)l.nb + 64) * 4)); s.prog_cap = (size_t)l.nb + 64; }
+  if (!s.multi && s.prog_cap < 2 * (size_t)l.nb + 64) { if (s.prog) CK(cudaFree(s.prog)); s.prog = nullptr; CK(cudaMalloc(&s.prog, (2 * (size_t)l.nb + 64) * 4)); s.prog_cap = 2 * (size_t)l.nb + 64; }
 }
 static void tables_single(Mem& s, int passes)
 {
@@ -348,6 +366,7 @@ static void tables_single(Mem& s, int passes)
   std::vector<int> pil(NPP); for (int i = 0; i < NPP; ++i) pil[i] = i;
   std::sort(pil.begin(), pil.end(), [&](int x, int y) { return strip_key(x, NI, s.k.tx) < strip_key(y, NI, s.k.tx); });
   std::vector<int> pos(NPP); for (int i = 0; i < NPP; ++i) pos[pil[i]] = i;
+  s.posv.assign(1, pos); s.nppv.assign(1, NPP);
   const int DONE = nblk;
   Dev& l = s.L[0]; l.ord.assign((size_t)nblk * 16, 0); l.nb = nblk;
   auto blk = [&](int p, int I, int J) { return p * NPP + pos[J * NI + I]; };
@@ -392,6 +411,7 @@ static void tables_multi(Mem& s, int passes)
     std::sort(pil[g].begin(), pil[g].end(), [&](int x, int y) { return strip_key(x, NI, s.k.tx) < strip_key(y, NI, s.k.tx); });
     for (int i = 0; i < NPP[g]; ++i) pos[g][pil[g][i]] = i;
   }
+  s.posv = pos; s.nppv = NPP;
   auto LB = [&](int p, int I, int J) { const int g = s.sr[J]; return p * NPP[g] + pos[g][(J - s.J0[g]) * NI + I]; };
   auto PR = [&](int p, int I, int J) { return (int)(s.sr[J] * PST + LB(p, I, J)); };
   auto DONE = [&](int g) { return (int)(g * PST + nblk[g]); };
@@ -435,22 +455,182 @@ static KP kparams(const Mem& s, const Dev& l, unsigned* prog, unsigned char* xp,
   P.NPAIR = s.G.NPAIR; P.CROW = (long)s.crow();
   return P;
 }
-// one launch of `passes` trips over the whole domain; returns the seconds of the launches
-static double launch(Mem& s, int passes)
+// ================================================================================================ agents inside a launch
+// Block (p, I, J) writes x pairs [8I - 3, 8I + 5) of row J at time 7(p + 1) and reads pairs [8I, 8I + 9) of row J and lanes 0..7 of
+// row J + 1; it starts once its guards ord[9..13] read DONE.  (p, I, J) done implies (p, I', J') done for I' <= I, J' <= J (the x and
+// y producer chains).  So the state of a region at time 7(p + 1) is final once one late enough block of pass p is done, and stays so
+// until the blocks of pass p + 1 that write it (copies) or touch it at all (writes) start.  Those "gated" blocks get their ord[9]
+// (previous-pass guard, (p, I + 1, J + 1)) redirected to an agent word, written DONE by the GPU's agent stream after: a stream wait
+// on the late block (which also covers the redirected guard), the work, and (last row of a GPU) the next GPU's part, through an
+// event.  The agent stream needs no SM: stream wait, copies (copy engines), and DONE written by a host-to-device copy (a memset
+// could run as a kernel, behind the persistent grid that holds every SM).
+// A boundary's work runs in parts, in pass order: first all writes (injections, one part), then the copies split by strip of the
+// schedule (x strips of tx pillars, the order in which a pass runs): each copy part waits only for its own strip's writers and holds
+// back only its own strip's blocks of the next pass, so it has about a pass to finish, and the parts pipeline on the copy engines.
+// A block held back by several parts waits for the last of them (the agent stream runs the parts in order).
+struct AgPart { int Itop = 0, q0 = -1, q1 = -1; std::vector<int> jtop, w0, w1; std::vector<char> seam, work; };   // q0 < 0: the writes
+struct AgB { int p; int64_t t; std::vector<AgPart> parts; };
+static inline long blk_local(const Mem& s, int g, int p, int I, int J) { return (long)p * s.nppv[g] + s.posv[g][(size_t)(J - s.Ja(g)) * s.G.NI + I]; }
+static inline long prog_index(const Mem& s, int g, long local) { return s.multi ? (long)g * s.PST + local : local; }
+static inline unsigned* prog_base(const Mem& s) { return s.multi ? reinterpret_cast<unsigned*>(s.pgb) : s.prog; }
+
+// the boundaries of a launch of P passes from plan step step0 that have agent work; patch[g] = (ord index, new value)
+static void plan_agents(Mem& s, int P, int64_t step0, const afdtd::AgentHooks& h, std::vector<AgB>& B,
+                        std::vector<std::vector<std::pair<long, int>>>& patch, std::vector<int>& nW)
 {
-  if (s.cur_passes != passes || memcmp(&s.cur_k, &s.k, sizeof s.k)) { (s.multi ? tables_multi : tables_single)(s, passes); s.cur_passes = passes; s.cur_k = s.k; }
+  const int NI = s.G.NI, NJ = s.G.NJ, NG = s.ngpu, TX = std::max(1, s.k.tx), NS = (NI + TX - 1) / TX;
+  std::vector<afdtd::Region> rg; std::vector<int> owner;            // per block (I, J) of the next pass: the last part holding it, -1
+  patch.assign(NG, {}); nW.assign(NG, 0);
+  for (int p = 0; p < P; ++p) {
+    const int64_t t = step0 + 7 * (int64_t)(p + 1);
+    if (!h.want(t)) continue;
+    rg.clear(); h.regions(t, rg);
+    const bool gate = p + 1 < P;                          // the next pass is in this launch
+    if (gate) owner.assign((size_t)NI * NJ, -1);
+    AgB b; b.p = p; b.t = t;
+    auto new_part = [&](int q0, int q1) { AgPart a; a.q0 = q0; a.q1 = q1; a.jtop.assign(NG, -1); a.w0.assign(NG, 0); a.w1.assign(NG, 0);
+                                          a.seam.assign(NG, 0); a.work.assign(NG, 0); return a; };
+    // one region's share of a part: writers' rows (work) and the blocks of the next pass it holds back (rows Jg0..J1-1, pillars Ig0..Ig1)
+    auto add = [&](AgPart& a, int ai, int J0, int J1, int Jg0, int Ig0, int Ig1, int& Imax) {
+      Imax = std::max(Imax, Ig1);
+      for (int g = 0; g < NG; ++g) {
+        const int Ja = s.Ja(g), Jb = s.Jb(g);
+        if (std::max(J0, Ja) < std::min(J1, Jb)) { a.work[g] = 1; a.jtop[g] = std::max(a.jtop[g], std::min(J1, Jb) - 1); }
+        const int lo = std::max(Jg0, Ja), hi = std::min(J1, Jb);
+        if (gate && lo < hi) {
+          a.jtop[g] = std::max(a.jtop[g], hi - 1);
+          for (int J = lo; J < hi; ++J) for (int I = Ig0; I <= Ig1; ++I) owner[(size_t)J * NI + I] = std::max(owner[(size_t)J * NI + I], ai);
+          if (hi == Jb && Jb < NJ) a.seam[g] = 1;          // held blocks in g's last row: their (p, I + 1, Jb) is on GPU g + 1
+        }
+      }
+    };
+    std::vector<int> imax;
+    {   // the writes: one part
+      AgPart a = new_part(-1, -1); int Imax = -1;
+      for (const auto& r : rg) {
+        if (!r.write) continue;
+        const int J0 = std::max(0, r.J0), J1 = std::min(NJ, r.J1), q0 = std::max(0, r.q0), q1 = r.q1;
+        if (J0 >= J1 || q0 >= q1) continue;
+        const int Iw0 = std::min(NI - 1, (q0 + 3) / 8), Iw1 = std::min(NI - 1, (q1 + 2) / 8);
+        const int Ig0 = std::max(0, std::min(Iw0, q0 / 8 - 1)), Ig1 = std::max(Iw1, std::min(NI - 1, (q1 - 1) / 8));
+        add(a, (int)b.parts.size(), J0, J1, std::max(0, J0 - 1), Ig0, Ig1, Imax);
+      }
+      if (Imax >= 0) { b.parts.push_back(a); imax.push_back(Imax); }
+    }
+    for (int st = 0; st < NS; ++st) {                     // the copies, strip by strip
+      const int Is0 = st * TX, Is1 = std::min(NI, Is0 + TX) - 1;
+      const int qs0 = std::max(0, 8 * Is0 - 3), qs1 = 8 * (Is1 + 1) - 3;        // pairs whose writer is in the strip
+      AgPart a = new_part(qs0, Is1 == NI - 1 ? (1 << 30) : qs1); int Imax = -1;
+      for (const auto& r : rg) {
+        if (r.write) continue;
+        const int J0 = std::max(0, r.J0), J1 = std::min(NJ, r.J1), q0 = std::max(r.q0, a.q0), q1 = std::min(r.q1, a.q1);
+        if (J0 >= J1 || q0 >= q1) continue;
+        const int Iw0 = std::min(NI - 1, (q0 + 3) / 8), Iw1 = std::min(NI - 1, (q1 + 2) / 8);
+        add(a, (int)b.parts.size(), J0, J1, J0, Iw0, Iw1, Imax);
+      }
+      if (Imax >= 0) { b.parts.push_back(a); imax.push_back(Imax); }
+    }
+    if (b.parts.empty()) continue;
+    for (size_t k = 0; k < b.parts.size(); ++k) {
+      AgPart& a = b.parts[k];
+      a.Itop = std::min(NI - 1, imax[k] + 1);
+      for (int g = 0; g < NG; ++g) if (a.jtop[g] >= 0) a.jtop[g] = std::min(s.Jb(g) - 1, a.jtop[g] + 1);
+      for (int g = 0; g + 1 < NG; ++g) if (a.seam[g]) a.jtop[g + 1] = std::max(a.jtop[g + 1], s.Ja(g + 1));
+    }
+    if (gate)                                             // agent words: each held block gets one, from the last part holding it
+      for (size_t k = 0; k < b.parts.size(); ++k)
+        for (int g = 0; g < NG; ++g) {
+          AgPart& a = b.parts[k];
+          a.w0[g] = nW[g];
+          const long base = (long)s.L[g].nb + 64;
+          for (int J = s.Ja(g); J < s.Jb(g); ++J) for (int I = 0; I < NI; ++I)
+            if (owner[(size_t)J * NI + I] == (int)k) patch[g].emplace_back(blk_local(s, g, p + 1, I, J) * 16 + 9, (int)prog_index(s, g, base + nW[g]++));
+          a.w1[g] = nW[g];
+        }
+    B.push_back(std::move(b));
+  }
+}
+// block tables on the device: the pristine ones, or with agent words in ord[9] of the gated blocks
+static void upload_ord(Mem& s, const std::vector<std::vector<std::pair<long, int>>>* patch)
+{
+  bool any = false; if (patch) for (auto& v : *patch) any |= !v.empty();
+  if (!any && !s.patched) return;
+  for (int g = 0; g < s.ngpu; ++g) {
+    Dev& l = s.L[g]; CK(cudaSetDevice(l.dev));
+    if (!any) { CK(cudaMemcpy(l.dord, l.ord.data(), l.ord.size() * sizeof(int), cudaMemcpyHostToDevice)); continue; }
+    std::vector<int> o = l.ord;
+    for (auto& pv : (*patch)[g]) o[(size_t)pv.first] = pv.second;
+    CK(cudaMemcpy(l.dord, o.data(), o.size() * sizeof(int), cudaMemcpyHostToDevice));
+  }
+  s.patched = any;
+}
+static void need_done_words(Mem& s, size_t n)
+{
+  if (s.hdone_n >= n) return;
+  if (s.hdone) CK(cudaFreeHost(s.hdone)); s.hdone = nullptr; s.hdone_n = 0;
+  CK(cudaHostAlloc(&s.hdone, std::max<size_t>(n, 1024) * 4, cudaHostAllocPortable));
+  s.hdone_n = std::max<size_t>(n, 1024);
+  for (size_t i = 0; i < s.hdone_n; ++i) s.hdone[i] = 0x3fffffffu;
+}
+static afdtd::AgentDev agent_dev(const Mem& s, int g)
+{ afdtd::AgentDev d{g, s.devs[g], s.Ja(g), s.Jb(g), reinterpret_cast<char*>(s.fld()), s.G.ROWREC, s.G.PLREC, s.ast[g]}; d.prec = AFDTD_PREC_CODE; return d; }
+// enqueue the agent work of every boundary, in order (the host may block in h.begin: back-pressure from the sinks)
+static void run_agents(Mem& s, const std::vector<AgB>& B, const afdtd::AgentHooks& h)
+{
+  unsigned* pb = prog_base(s);
+  for (const AgB& b : B) {
+    h.begin(b.t);
+    for (const AgPart& a : b.parts)
+      for (int g = s.ngpu - 1; g >= 0; --g) {
+        if (a.jtop[g] < 0) continue;
+        CK(cudaSetDevice(s.devs[g])); cudaStream_t st = s.ast[g];
+        const long tgt = prog_index(s, g, blk_local(s, g, b.p, a.Itop, a.jtop[g]));
+        CU(afdtd::drv().StreamWaitValue32((CUstream)st, (CUdeviceptr)(pb + tgt), 0x3fffffffu, CU_STREAM_WAIT_VALUE_GEQ));
+        if (a.work[g]) h.work(b.t, agent_dev(s, g), a.q0, a.q1);
+        if (g > 0 && a.seam[g - 1]) CK(cudaEventRecord(s.aev[g], st));
+        if (a.seam[g]) CK(cudaStreamWaitEvent(st, s.aev[g + 1], 0));
+        if (a.w1[g] > a.w0[g])
+          CK(cudaMemcpyAsync(pb + prog_index(s, g, (long)s.L[g].nb + 64 + a.w0[g]), s.hdone, (size_t)(a.w1[g] - a.w0[g]) * 4, cudaMemcpyHostToDevice, st));
+      }
+    h.end(b.t);
+  }
+}
+// after a failure while enqueuing: every agent word DONE (a copy on a fresh stream), so that the launch can finish
+static void release_agents(Mem& s, const std::vector<int>& nW) noexcept
+{
+  unsigned* pb = prog_base(s);
+  for (int g = 0; g < s.ngpu; ++g) {
+    if (!nW[g] || !s.hdone) continue;
+    cudaSetDevice(s.devs[g]); cudaStream_t ds = nullptr;
+    if (cudaStreamCreateWithFlags(&ds, cudaStreamNonBlocking) != cudaSuccess) continue;
+    cudaMemcpyAsync(pb + prog_index(s, g, (long)s.L[g].nb + 64), s.hdone, (size_t)nW[g] * 4, cudaMemcpyHostToDevice, ds);
+    cudaStreamSynchronize(ds); cudaStreamDestroy(ds);
+  }
+}
+
+// one launch of `passes` trips over the whole domain (from plan step step0, agents h or none); returns the seconds of the launches
+static double launch(Mem& s, int passes, int64_t step0, const afdtd::AgentHooks* h)
+{
+  if (s.cur_passes != passes || memcmp(&s.cur_k, &s.k, sizeof s.k)) { (s.multi ? tables_multi : tables_single)(s, passes); s.cur_passes = passes; s.cur_k = s.k; s.patched = false; }
+  std::vector<AgB> B; std::vector<std::vector<std::pair<long, int>>> patch; std::vector<int> nW(s.ngpu, 0);
+  if (h) plan_agents(s, passes, step0, *h, B, patch, nW);
+  upload_ord(s, B.empty() ? nullptr : &patch);
+  size_t maxw = 0; for (int w : nW) maxw = std::max(maxw, (size_t)w);
+  if (maxw) need_done_words(s, maxw);
+  auto agents = [&]() { if (B.empty()) return; try { run_agents(s, B, *h); } catch (...) { release_agents(s, nW); sync_all(s); throw; } };
   const Geo& G = s.G;
   if (!s.multi) {
     Dev& l = s.L[0]; const int nblk = l.nb;
     CK(cudaSetDevice(l.dev));
     CK(cudaMemset(s.XP, 0, s.nxp)); CK(cudaMemset(s.YH, 0, s.nyh));
-    std::vector<unsigned> hp((size_t)nblk + 64, 0u); hp[nblk] = 0x3fffffffu;
+    std::vector<unsigned> hp((size_t)nblk + 64 + nW[0], 0u); hp[nblk] = 0x3fffffffu;
     CK(cudaMemcpy(s.prog, hp.data(), hp.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMemset(l.dtim, 0, (size_t)nblk * 16 * sizeof(long long))); CK(cudaMemset(l.dtick, 0, 64));
     CK(cudaDeviceSynchronize());
     const int GRID = std::min(s.k.grid == 0 ? s.nsm : s.k.grid, nblk);
     const double t0 = now();
-    launch_stream(kparams(s, l, s.prog, s.XP, s.YH, 0), GRID, 0, s.FLD, s.COE, G, G.NJ + 1, G.NJ, s.CROW);
+    launch_stream(kparams(s, l, s.prog, s.XP, s.YH, 0), GRID, s.mst[0], s.FLD, s.COE, G, G.NJ + 1, G.NJ, s.CROW);
+    agents();
     CK(cudaDeviceSynchronize());
     const double t1 = now();
     scrub_k<<<(unsigned)((s.nrec + 255) / 256), 256>>>(G, s.FLD, 0, s.nrec);
@@ -469,9 +649,10 @@ static double launch(Mem& s, int passes)
   const double t0 = now();
   for (auto& l : s.L) {
     CK(cudaSetDevice(l.dev));
-    launch_stream(kparams(s, l, prog, reinterpret_cast<unsigned char*>(s.xpb), reinterpret_cast<unsigned char*>(s.yhb), 0), std::min(GRIDA, l.nb), 0,
-                  s.fld(), s.coe(), G, G.NJ + 1, G.NJ, s.CRSB);
+    launch_stream(kparams(s, l, prog, reinterpret_cast<unsigned char*>(s.xpb), reinterpret_cast<unsigned char*>(s.yhb), 0), std::min(GRIDA, l.nb),
+                  s.mst[&l - s.L.data()], s.fld(), s.coe(), G, G.NJ + 1, G.NJ, s.CRSB);
   }
+  agents();
   std::vector<cudaError_t> er(NG, cudaSuccess);
   { std::vector<std::thread> th;
     for (int i = 0; i < NG; ++i) th.emplace_back([&, i]() { cudaSetDevice(s.L[i].dev); er[i] = cudaDeviceSynchronize(); tend[i] = now(); });
@@ -490,6 +671,9 @@ static void m_destroy(void* st)
 {
   Mem* s = static_cast<Mem*>(st); if (!s) return;
   for (auto& l : s->L) { cudaSetDevice(l.dev); cudaFree(l.dord); cudaFree(l.dtim); cudaFree(l.dtick); }
+  for (size_t g = 0; g < s->ast.size(); ++g) { cudaSetDevice(s->devs[g]); if (s->ast[g]) cudaStreamDestroy(s->ast[g]); if (s->aev[g]) cudaEventDestroy(s->aev[g]);
+                                               if (g < s->mst.size() && s->mst[g]) cudaStreamDestroy(s->mst[g]); }
+  if (s->hdone) cudaFreeHost(s->hdone);
   for (size_t d = 0; d < s->dsum.size(); ++d) { cudaSetDevice(s->devs[d]); cudaFree(s->dsum[d]); }
   if (!s->devs.empty()) { cudaSetDevice(s->devs[0]); cudaFree(s->stage); }
   if (!s->multi) { if (!s->devs.empty()) cudaSetDevice(s->devs[0]); cudaFree(s->FLD); cudaFree(s->COE); cudaFree(s->XP); cudaFree(s->YH); cudaFree(s->prog); }
@@ -511,6 +695,10 @@ static void* m_create(const Geo& G, const int* devs, int n, const Knobs& k)
     s->L.resize(n); for (int g = 0; g < n; ++g) s->L[g].dev = devs[g];
     s->dsum.assign(n, nullptr);
     for (int g = 0; g < n; ++g) { CK(cudaSetDevice(devs[g])); CK(cudaMalloc(&s->dsum[g], 64)); }
+    s->ast.assign(n, nullptr); s->aev.assign(n, nullptr); s->mst.assign(n, nullptr);
+    for (int g = 0; g < n; ++g) { CK(cudaSetDevice(devs[g])); CK(cudaStreamCreateWithFlags(&s->ast[g], cudaStreamNonBlocking));
+      CK(cudaStreamCreateWithFlags(&s->mst[g], cudaStreamNonBlocking));
+      CK(cudaEventCreateWithFlags(&s->aev[g], cudaEventDisableTiming)); }
     return s;
   } catch (...) { m_destroy(s); throw; }
 }
@@ -541,11 +729,38 @@ static void m_box(void* st, const int64_t off[3], const int64_t shape[3], uint16
     if (dir == 1) for (int c = 0; c < 12; ++c) if (comp[c]) CK(cudaMemcpy(comp[c] + (size_t)xa * plane, S.f[c], cnt * 2, cudaMemcpyDeviceToHost));
   }
 }
-static double m_advance(void* st, int64_t passes)
+// the agents' work at t on the state as it is (no launch running), synchronous
+static void m_agents_now(void* st, int64_t t, const afdtd::AgentHooks& h)
 {
   Mem& s = *static_cast<Mem*>(st);
+  std::vector<afdtd::Region> rg; h.regions(t, rg);
+  sync_all(s);
+  h.begin(t);
+  for (int g = 0; g < s.ngpu; ++g) {
+    bool any = false; for (auto& r : rg) any |= std::max(r.J0, s.Ja(g)) < std::min(r.J1, s.Jb(g));
+    if (!any) continue;
+    CK(cudaSetDevice(s.devs[g])); h.work(t, agent_dev(s, g), -1, -1); h.work(t, agent_dev(s, g), 0, 1 << 30);   // writes, then copies
+  }
+  h.end(t);
+  for (int g = 0; g < s.ngpu; ++g) { CK(cudaSetDevice(s.devs[g])); CK(cudaStreamSynchronize(s.ast[g])); }
+}
+// passes trips from plan step step0.  Agent work runs inside the launches (stream waits); without stream memory operations in the
+// driver, each launch ends at the next boundary with work instead (slower: a drain and a scrub per boundary).
+static double m_advance(void* st, int64_t passes, int64_t step0, const afdtd::AgentHooks* h)
+{
+  Mem& s = *static_cast<Mem*>(st);
+  // CUDA_LAUNCH_BLOCKING makes a launch return only when it is done, before the agent work could be enqueued: end the launches
+  // at the boundaries instead
+  static const bool blocking = [] { const char* e = getenv("CUDA_LAUNCH_BLOCKING"); return e && atoi(e) != 0; }();
+  const bool inl = h && afdtd::drv().StreamWaitValue32 && !blocking;
   double sec = 0;
-  for (int64_t done = 0; done < passes;) { const int p = (int)std::min<int64_t>(afdtd::kPMAX, passes - done); sec += launch(s, p); done += p; }
+  for (int64_t done = 0; done < passes;) {
+    int p = (int)std::min<int64_t>(afdtd::kPMAX, passes - done);
+    if (h && !inl) { int q = 1; while (q < p && !h->want(step0 + 7 * (done + q))) ++q; p = q; }
+    sec += launch(s, p, step0 + 7 * done, inl ? h : nullptr);
+    done += p;
+    if (h && !inl && h->want(step0 + 7 * done)) m_agents_now(st, step0 + 7 * done, *h);
+  }
   return sec;
 }
 // H half step on every GPU, all synchronised, then the E half step (the reference's step order); several GPUs read the seam rows
@@ -913,4 +1128,5 @@ static void h_tail(HostDomain& h, int r)
 
 extern const afdtd::Object AFDTD_SYM;
 const afdtd::Object AFDTD_SYM = {AFDTD_NAME, AFDTD_ARCH, AFDTD_CC, AFDTD_NS::m_create, AFDTD_NS::m_destroy, AFDTD_NS::m_set_knobs, AFDTD_NS::m_box,
-                                 AFDTD_NS::m_advance, AFDTD_NS::m_tail, AFDTD_NS::m_checksums, AFDTD_NS::m_zero, AFDTD_NS::h_run, AFDTD_NS::h_tail};
+                                 AFDTD_NS::m_advance, AFDTD_NS::m_agents_now, AFDTD_NS::m_tail, AFDTD_NS::m_checksums, AFDTD_NS::m_zero, AFDTD_NS::h_run, AFDTD_NS::h_tail,
+                                 AFDTD_PREC_CODE};

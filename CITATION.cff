@@ -1,9 +1,9 @@
 cff-version: 1.2.0
 message: "If you use alpha-fdtd, please cite it as below."
-title: "alpha-fdtd: BF16 Yee FDTD for large 3-D domains on NVIDIA GPUs"
+title: "alpha-fdtd: Yee FDTD (BF16, FP16, FP32) for large 3-D domains on NVIDIA GPUs"
 authors:
   - name: "SPINS Photonics Inc."
-version: 0.1.0
-date-released: 2026-11-25
+version: 0.2.0
+date-released: 2026-11-26
 license: MIT
 repository-code: "https://github.com/spinsphotonics/alpha-fdtd"

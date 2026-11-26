@@ -26,6 +26,11 @@ void cuda_fail(int err, const char* what, int line)
   fail(oom ? AFDTD_ENOMEM : AFDTD_EDEVICE, "CUDA: %s (%d) in %s (line %d)", s, err, what, line);
 }
 
+std::recursive_mutex& device_lock(int dev)
+{
+  static std::recursive_mutex m[256];
+  return m[(unsigned)dev % 256];
+}
 const Driver& drv()
 {
   static Driver d = [] {
@@ -99,8 +104,9 @@ static void host_layout(HostDomain& h)
   h.RSB = (size_t)G.ROWREC * 24; h.CSB = (size_t)G.NZP * G.PS; h.CROW = rup(h.CSB, kGR); h.HRS = h.RSB + rup(h.CSB, 4096);
   h.bytes = (size_t)G.NJ * h.HRS;
 }
-void bytes_needed(int64_t nx, int64_t ny, int64_t nz, int ngpus, size_t* gpu, size_t* host)
+void bytes_needed(int64_t nx, int64_t ny, int64_t nz, int ngpus, size_t* gpu, size_t* host, unsigned flags)
 {
+  if (flags & AFDTD_FP32) { if (gpu) *gpu = f32_bytes(nx, ny, nz, ngpus) + reserve_bytes(ny, nz); if (host) *host = 0; return; }
   const Geo G = geometry(nx, ny, nz, ngpus > 1), Gh = geometry(nx, ny, nz, true);
   const int rows = (G.NJ + ngpus - 1) / ngpus;
   if (gpu) *gpu = std::min(mem_bytes(G, ngpus, mx_rule(G.NI, rows, 148, 12, ngpus, G.NJ)), mem_bytes(G, ngpus, mx_rule(G.NI, rows, 148, 12, ngpus, G.NJ, true)))
@@ -126,9 +132,9 @@ static double predict(int dev, int cc, int ngpus, bool on_host)
 }
 
 // ------------------------------------------------------------------------------------------------ objects and candidates
-static const Object* object_for(int cc, const char* name)
+static const Object* object_for(int cc, const char* name, int prec)
 {
-  for (const Object* o : objects()) if (o->cc == cc && (!name || !strcmp(o->name, name))) return o;
+  for (const Object* o : objects()) if (o->cc == cc && o->prec == prec && (!name || !strcmp(o->name, name))) return o;
   return nullptr;
 }
 struct Cand { const Object* obj; Knobs k; };
@@ -139,7 +145,7 @@ static std::vector<Cand> candidates(const Plan& p, const Geo& G, int rigor)
   const int ng = (int)p.devs.size(), rows = (G.NJ + ng - 1) / ng, grid = p.nsm;
   std::vector<Cand> out;
   auto add = [&](const char* obj, int g, int tx, int gate) {
-    const Object* o = object_for(p.cc, obj);
+    const Object* o = object_for(p.cc, obj, p.prec);
     if (!o) return;
     Knobs k; k.grid = g; k.tx = tx; k.gate = gate; k.mx = mx_rule(G.NI, rows, g, tx, ng, G.NJ, p.small_pools);
     for (auto& c : out) if (c.obj == o && !memcmp(&c.k, &k, sizeof k)) return;
@@ -177,7 +183,7 @@ static bool parse_sched(Plan& p, const std::string& s, const Geo& G, size_t budg
   char obj[64] = {0}; Knobs k; int S = 0, slots = 0, qmax = 0; double lam = 0;
   if (p.on_host) { if (sscanf(s.c_str(), "obj=%63s host S=%d slots=%d lam=%lf qmax=%d", obj, &S, &slots, &lam, &qmax) != 5) return false; }
   else if (sscanf(s.c_str(), "obj=%63s grid=%d tx=%d gate=%d mx=%d", obj, &k.grid, &k.tx, &k.gate, &k.mx) != 5) return false;
-  const Object* o = object_for(p.cc, obj);
+  const Object* o = object_for(p.cc, obj, p.prec);
   if (!o) return false;
   p.obj = o;
   if (p.on_host) {
@@ -195,8 +201,8 @@ static bool parse_sched(Plan& p, const std::string& s, const Geo& G, size_t budg
 static std::string wisdom_key(const Plan& p)
 {
   char b[400];
-  snprintf(b, sizeof b, "kset=%s gpu=\"%s\" cc=%d.%d sm=%d ngpus=%d size=%lldx%lldx%lld mode=%s", AFDTD_KSET, p.gpu_name.c_str(), p.cc / 10, p.cc % 10,
-           p.nsm, (int)p.devs.size(), (long long)p.n[0], (long long)p.n[1], (long long)p.n[2], p.on_host ? "host" : "gpu");
+  snprintf(b, sizeof b, "kset=%s gpu=\"%s\" cc=%d.%d sm=%d ngpus=%d size=%lldx%lldx%lld mode=%s%s", AFDTD_KSET, p.gpu_name.c_str(), p.cc / 10, p.cc % 10,
+           p.nsm, (int)p.devs.size(), (long long)p.n[0], (long long)p.n[1], (long long)p.n[2], p.on_host ? "host" : "gpu", p.prec == AFDTD_F16 ? " prec=fp16" : "");
   return b;
 }
 
@@ -213,7 +219,7 @@ static void self_check(const Object* o, int dev, const Knobs& kp)
   Knobs k = kp; k.mx = mx_rule(G.NI, G.NJ, k.grid, k.tx, 1, G.NJ);
   std::vector<uint16_t> in((size_t)12 * N), a((size_t)12 * N), b((size_t)12 * N);
   std::mt19937_64 rng(12345);
-  auto bf = [](float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)((u + 0x7FFF + ((u >> 16) & 1)) >> 16); };
+  auto bf = [o](float f) { uint32_t u; memcpy(&u, &f, 4); return o->prec == AFDTD_F16 ? f32_to_f16(u) : (uint16_t)((u + 0x7FFF + ((u >> 16) & 1)) >> 16); };
   for (int c = 0; c < 12; ++c)
     for (int64_t i = 0; i < N; ++i) {
       const int64_t x = i / (n[1] * n[2]), y = i / n[2] % n[1], z = i % n[2], pos[3] = {x, y, z};
@@ -226,7 +232,7 @@ static void self_check(const Object* o, int dev, const Knobs& kp)
     try {
       uint16_t* cp[12]; for (int c = 0; c < 12; ++c) cp[c] = in.data() + (size_t)c * N;
       o->box(st, off, n, cp, 0);
-      if (engine) { o->advance(st, 2); o->tail(st, 3); } else o->tail(st, 17);
+      if (engine) { o->advance(st, 2, 0, nullptr); o->tail(st, 3); } else o->tail(st, 17);
       for (int c = 0; c < 12; ++c) cp[c] = out.data() + (size_t)c * N;
       o->box(st, off, n, cp, 1);
     } catch (...) { o->destroy(st); throw; }
@@ -255,7 +261,7 @@ static void check_devices(Plan& p, int ngpus, const int* devices)
     AF_CK(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, d)); AF_CK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, d));
     AF_CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d)); AF_CK(cudaGetDeviceProperties(&pr, d));
     const int cc = 10 * mj + mn;
-    if (!object_for(cc, nullptr))
+    if (!object_for(cc, nullptr, AFDTD_BF16))
       fail(AFDTD_EUNSUPPORTED, "device %d (%s, compute capability %d.%d) is not supported (8.0, 9.0, 10.0, 10.3) or not built into this library", d, pr.name, mj, mn);
     if (d == p.devs[0]) { p.cc = cc; p.nsm = nsm; p.gpu_name = pr.name; }
     else if (cc != p.cc || nsm != p.nsm || p.gpu_name != pr.name) fail(AFDTD_EUNSUPPORTED, "devices %d and %d are different GPU models", p.devs[0], d);
@@ -282,14 +288,33 @@ Plan* plan_create(int64_t nx, int64_t ny, int64_t nz, int ngpus, const int* devi
   for (int a = 0; a < 3; ++a) if (n[a] < 16 || n[a] > (1 << 20)) fail(AFDTD_EINVAL, "size %lld x %lld x %lld: each axis needs 16 to 1048576 cells", (long long)nx, (long long)ny, (long long)nz);
   if ((double)nx * ny * nz > 4e15) fail(AFDTD_EINVAL, "size %lld x %lld x %lld: too many cells", (long long)nx, (long long)ny, (long long)nz);
   if (rigor < AFDTD_ESTIMATE || rigor > AFDTD_WISDOM_ONLY) fail(AFDTD_EINVAL, "rigor %d is not AFDTD_ESTIMATE, _MEASURE, _PATIENT or _WISDOM_ONLY", rigor);
-  if (flags & ~(AFDTD_FORCE_HOST | AFDTD_STRICT_WALLS)) fail(AFDTD_EINVAL, "unknown flag bits 0x%x (a rigor value passed as a flag?)", flags & ~(AFDTD_FORCE_HOST | AFDTD_STRICT_WALLS));
+  const unsigned known = AFDTD_FORCE_HOST | AFDTD_STRICT_WALLS | AFDTD_FP16 | AFDTD_FP32;
+  if (flags & ~known) fail(AFDTD_EINVAL, "unknown flag bits 0x%x (a rigor value passed as a flag?)", flags & ~known);
+  if ((flags & AFDTD_FP16) && (flags & AFDTD_FP32)) fail(AFDTD_EINVAL, "AFDTD_FP16 and AFDTD_FP32 together: choose one precision");
   if (ngpus < 0 || ngpus > 8) fail(AFDTD_EINVAL, "ngpus = %d: 1 to 8 (0 means 1)", ngpus);
   if (ngpus == 0) { ngpus = 1; if (devices) fail(AFDTD_EINVAL, "devices given with ngpus = 0"); }
   Plan* pp = new Plan;
   try {
     Plan& p = *pp;
     p.n[0] = nx; p.n[1] = ny; p.n[2] = nz; p.flags = flags;
+    p.prec = (flags & AFDTD_FP32) ? AFDTD_F32 : (flags & AFDTD_FP16) ? AFDTD_F16 : AFDTD_BF16;
     check_devices(p, ngpus, devices);
+    if (p.prec == AFDTD_F32) {                         // FP32: dense arrays in GPU memory, one kernel per half step; nothing to plan
+      if (flags & AFDTD_FORCE_HOST) fail(AFDTD_EINVAL, "AFDTD_FP32 plans keep the domain in GPU memory (AFDTD_FORCE_HOST is for BF16 and FP16)");
+      if (nx < 2 * ngpus) fail(AFDTD_EINVAL, "nx = %lld on %d GPUs: FP32 plans cut the domain along x, at least 2 planes per GPU", (long long)nx, ngpus);
+      const size_t freeb = min_free(p), need = f32_bytes(nx, ny, nz, ngpus) + reserve_bytes(ny, nz);
+      if (need > freeb)
+        fail(AFDTD_ENOMEM, "%lld x %lld x %lld in FP32 needs %.2f GiB per GPU (48 bytes per cell), %.2f GiB free on the fullest of %d GPU(s); FP32 plans "
+             "need the domain in GPU memory (BF16 and FP16 plans need about a third as much, and can use host memory)", (long long)nx, (long long)ny,
+             (long long)nz, gib(need), gib(freeb), ngpus);
+      p.obj = &kF32Object; p.on_host = 0; p.rigor = rigor == AFDTD_WISDOM_ONLY ? AFDTD_ESTIMATE : rigor; p.gpu_bytes = f32_bytes(nx, ny, nz, ngpus);
+      int mclk = 0, bus = 0; cudaDeviceGetAttribute(&mclk, cudaDevAttrMemoryClockRate, p.devs[0]); cudaDeviceGetAttribute(&bus, cudaDevAttrGlobalMemoryBusWidth, p.devs[0]);
+      cudaGetLastError();
+      p.predicted = mclk > 0 && bus > 0 ? 2.0 * mclk * 1e3 * bus / 8 / 96 * ngpus : 0;   // memory floor: 96 B per update (two half-step kernels)
+      p.mem = p.obj->create(geometry(nx, ny, nz, false), p.devs.data(), ngpus, p.knobs);
+      p.sched = "obj=f32";
+      return pp;
+    }
     // ---- memory mode
     const Geo G = geometry(nx, ny, nz, ngpus > 1);
     const size_t freeb = min_free(p), resv = reserve_bytes(ny, nz), budget = freeb > resv ? freeb - resv : 0;
@@ -326,7 +351,7 @@ Plan* plan_create(int64_t nx, int64_t ny, int64_t nz, int ngpus, const int* devi
     std::string ws; int wr = 0; double wrate = 0;
     if (wisdom_find(key, rigor == AFDTD_WISDOM_ONLY ? 0 : rigor, ws, wr, wrate) && parse_sched(p, ws, G, budget)) { p.from_wisdom = 1; p.rigor = wr; p.measured = wrate; }
     else if (rigor == AFDTD_WISDOM_ONLY) fail(AFDTD_ENOPLAN, "AFDTD_WISDOM_ONLY: no usable wisdom record for %s", key.c_str());
-    else if (p.on_host) { p.obj = object_for(p.cc, p.cc < 90 ? "zs7_cpasync_l2h0" : nullptr); p.rigor = rigor; }
+    else if (p.on_host) { p.obj = object_for(p.cc, p.cc < 90 ? "zs7_cpasync_l2h0" : nullptr, p.prec); p.rigor = rigor; }
     else { p.obj = est[0].obj; p.knobs = est[0].k; p.rigor = rigor; }
     p.predicted = predict(p.devs[0], p.cc, ngpus, p.on_host);
     for (int d : p.devs) self_check(p.obj, d, p.on_host ? est[0].k : p.knobs);
@@ -345,7 +370,7 @@ Plan* plan_create(int64_t nx, int64_t ny, int64_t nz, int ngpus, const int* devi
           for (auto& x : st) if (x.first == cs[i].obj) m = x.second;
           if (!m) { m = cs[i].obj->create(G, p.devs.data(), ngpus, cs[i].k); st.push_back({cs[i].obj, m}); }
           cs[i].obj->set_knobs(m, cs[i].k);
-          return cs[i].obj->advance(m, P);
+          return cs[i].obj->advance(m, P, 0, nullptr);
         };
         const int rounds = rigor == AFDTD_PATIENT ? 3 : 2;
         try {
@@ -372,6 +397,8 @@ Plan* plan_create(int64_t nx, int64_t ny, int64_t nz, int ngpus, const int* devi
 void plan_destroy(Plan* p)
 {
   if (!p) return;
+  record_close_all(*p);
+  inject_close_all(*p);
   try { if (p->mem) p->obj->destroy(p->mem); } catch (...) {}
   host_free(p->host);
   delete p;
@@ -384,8 +411,32 @@ void plan_execute(Plan& p, int64_t steps)
   const int64_t passes = steps / kK; const int r = (int)(steps % kK);
   auto wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
   const double w0 = wall();
-  if (!p.on_host) {
-    if (passes) p.obj->advance(p.mem, passes);
+  if (!p.on_host && (record_active(p) || inject_active(p))) {
+    // with recorders or injectors: their work is at multiples of 7, so the passes start at a multiple of 7: a head of tail steps
+    // first (the result is the same for any split of the steps), the work due at the start, the passes with the work inside the
+    // launches, the remaining tail steps.  Injections first at a step, then frames.  While an injection is due in the call, the
+    // persistent grid leaves one SM free for the injection kernels (they run beside it).
+    const AgentHooks rh = record_hooks(p), jh = inject_hooks(p);
+    AgentHooks h;
+    h.want = [rh, jh](int64_t t) { return jh.want(t) || rh.want(t); };
+    h.regions = [rh, jh](int64_t t, std::vector<Region>& o) { jh.regions(t, o); rh.regions(t, o); };
+    h.begin = [rh](int64_t t) { rh.begin(t); };
+    h.work = [rh, jh](int64_t t, const AgentDev& d, int q0, int q1) { if (q0 < 0) jh.work(t, d, q0, q1); else rh.work(t, d, q0, q1); };
+    h.end = [rh, jh](int64_t t) { jh.end(t); rh.end(t); };
+    const Knobs k0 = p.knobs;
+    const bool spare = inject_due_between(p, p.steps_done + 1, p.steps_done + steps);
+    if (spare) { Knobs k = k0; k.grid = std::max(1, (k0.grid ? k0.grid : p.nsm) - 1); p.obj->set_knobs(p.mem, k); }
+    struct Restore { Plan& p; Knobs k; bool on; ~Restore() { if (on) try { p.obj->set_knobs(p.mem, k); } catch (...) {} } } restore{p, k0, spare};
+    int64_t t = p.steps_done, left = steps;
+    auto now_if = [&]() { if (h.want(t)) p.obj->agents_now(p.mem, t, h); };
+    now_if();
+    const int64_t head = std::min<int64_t>(left, (kK - t % kK) % kK);
+    if (head) { p.obj->tail(p.mem, (int)head); t += head; left -= head; now_if(); }
+    if (left / kK) { p.obj->advance(p.mem, left / kK, t, &h); t += left / kK * kK; }
+    if (left % kK) p.obj->tail(p.mem, (int)(left % kK));
+    p.tail_steps += head + left % kK - r;            // r is added below
+  } else if (!p.on_host) {
+    if (passes) p.obj->advance(p.mem, passes, p.steps_done, nullptr);
     if (r) p.obj->tail(p.mem, r);
   } else {
     HostDomain& h = p.host;
@@ -402,8 +453,11 @@ void plan_execute(Plan& p, int64_t steps)
     if (r) p.obj->host_tail(h, r);
   }
   const double w = wall() - w0;
-  p.steps_done += steps; p.tail_steps += r;
+  if (p.prec == AFDTD_F32) p.tail_steps = 0;          // one kernel per half step for every step: no tail path
+  p.steps_done += steps; if (p.prec != AFDTD_F32) p.tail_steps += r;
   p.last_rate = w > 0 ? (double)p.n[0] * p.n[1] * p.n[2] * steps / w : 0;
+  const std::string e = record_take_error(p);
+  if (!e.empty()) fail(AFDTD_EIO, "the steps ran, but a recorder failed (frames from then on are missing): %s", e.c_str());
 }
 
 void plan_checksums(Plan& p, uint64_t out[6])
@@ -418,9 +472,10 @@ std::string plan_describe(const Plan& p)
   char hint[160] = "";
   if (p.on_host) snprintf(hint, sizeof hint, "; host memory: predicted rate for execute calls of >= %d steps (each call streams the domain over "
                           "the host link once per %d steps)", kK * p.host.ring.qmax, kK * p.host.ring.qmax);
-  snprintf(b, sizeof b, "%lld x %lld x %lld in %s memory on %d x %s; rigor %s%s; predicted %.3g, measured %.3g, last %.3g cell updates/s; "
+  snprintf(b, sizeof b, "%lld x %lld x %lld %s in %s memory on %d x %s; rigor %s%s; predicted %.3g, measured %.3g, last %.3g cell updates/s; "
            "%lld steps, %lld on the tail path; %.2f GiB per GPU, %.2f GiB host%s | schedule (opaque, as in wisdom): %s",
-           (long long)p.n[0], (long long)p.n[1], (long long)p.n[2], p.on_host ? "host" : "GPU", (int)p.devs.size(), p.gpu_name.c_str(), rn[p.rigor],
+           (long long)p.n[0], (long long)p.n[1], (long long)p.n[2], p.prec == AFDTD_F32 ? "FP32" : p.prec == AFDTD_F16 ? "FP16" : "BF16",
+           p.on_host ? "host" : "GPU", (int)p.devs.size(), p.gpu_name.c_str(), rn[p.rigor],
            p.from_wisdom ? " (from wisdom)" : "", p.predicted, p.measured, p.last_rate, (long long)p.steps_done, (long long)p.tail_steps,
            gib(p.gpu_bytes), gib(p.host_bytes), hint, p.sched.c_str());
   return b;

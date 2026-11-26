@@ -5,8 +5,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "alpha-fdtd"
-version = "0.1.0"
-description = "BF16 FDTD (lossy Yee, closed PEC box) for large domains on 1 to 8 NVIDIA GPUs"
+version = "0.2.0"
+description = "FDTD (lossy Yee, closed PEC box; BF16, FP16 or FP32) for large domains on 1 to 8 NVIDIA GPUs, with recording and DFT for pulsed runs"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "SPINS Photonics Inc." }]

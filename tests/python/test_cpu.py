@@ -81,7 +81,7 @@ class FakeLib:
         return self.err
 
     def afdtd_version(self):
-        return b"0.1.0"
+        return b"0.2.0"
 
 
 @pytest.fixture
@@ -143,7 +143,7 @@ def test_set_subbox_needs_offset(plan, fake):
 
 @pytest.mark.parametrize("bad, exc", [
     (dict(E=np.zeros((3, 32, 33, 34))), TypeError),                       # float64
-    (dict(E=np.zeros((3, 32, 33, 34), np.float16)), TypeError),
+    (dict(E=np.zeros((3, 32, 33, 34), np.complex64)), TypeError),
     (dict(Ex=np.zeros((32, 33, 34), ">f4")), TypeError),                  # byte-swapped
     (dict(Ex=[[[0.0]]]), TypeError),
     (dict(Ex=np.zeros((32, 33, 34), np.float32)[::-1]), ValueError),     # negative stride
@@ -308,7 +308,7 @@ def test_close_waits_for_a_call_in_flight(fake):
 # -- the real library, no GPU needed -----------------------------------------------------------------------------------
 
 def test_version():
-    assert af.version() == af.__version__ == "0.1.0"
+    assert af.version() == af.__version__ == "0.2.0"
 
 
 def test_bytes_needed():
@@ -319,6 +319,11 @@ def test_bytes_needed():
         af.bytes_needed((15, 16, 16))
     with pytest.raises(af.InvalidArgument, match="too many cells"):
         af.bytes_needed((2 ** 20,) * 3)                                   # would overflow size_t
+    g3, h3 = af.bytes_needed((1000, 1000, 1000), precision="fp32")
+    g4, _ = af.bytes_needed((1000, 1000, 1000), precision="fp16")
+    assert g3 >= 48e9 and h3 == 0 and g4 == g1                           # FP32: 48 bytes per cell, GPU memory only
+    with pytest.raises(ValueError):
+        af.bytes_needed((100, 100, 100), precision="fp64")
 
 
 def test_plan_refusals_without_gpu():

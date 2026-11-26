@@ -1,9 +1,10 @@
 # alpha-fdtd
 
 A finite-difference time-domain (FDTD) solver for large 3-D domains on 1 to 8 NVIDIA GPUs. The domain lives in GPU
-memory, or, when it does not fit, in host memory streamed through the GPUs. It does one thing: the lossy Yee update in
-BF16 with per-cell, per-axis coefficients, in a closed PEC box. The result is bit-identical to a plain reference kernel
-for every plan, step count, memory mode and GPU count.
+memory, or, when it does not fit, in host memory streamed through the GPUs. It does one thing: the lossy Yee update
+with per-cell, per-axis coefficients, in a closed PEC box, in BF16 (default), FP16 or FP32. The result is bit-identical
+to a plain reference kernel in that precision for every plan, step count, memory mode and GPU count. It can record a
+region of the domain while it runs and Fourier-transform the record at the end (pulsed runs).
 
 It is a C library (`libalphafdtd.so`, header `include/alpha_fdtd.h`) with a thin Python wrapper (`alpha_fdtd`, NumPy in
 and out). Each Python method is one C call.
@@ -64,6 +65,7 @@ conductivity, copy `yee_coefficients` from `examples/coefficients.py`.
 More in `examples/`:
 
 - `coefficients.py`: Ca and Cb from permittivity, conductivity and dt, and a graded absorber.
+- `pulse.py`: a pulsed run: a broadband source, a recorder on a sub-box, the fields at 200 frequencies (see below).
 - `from_fdtdz.py`: an fdtdz-style run with a source plane and output steps.
 - `offload.py`: a domain in host memory.
 - `multi_gpu.py`: two GPUs, bit-identical to one.
@@ -76,10 +78,11 @@ More in `examples/`:
 steps, and it returns E at those steps. alpha-fdtd instead keeps a state that you step and read. The main differences:
 
 - `Cb = dt * dt / eps` (the absorbed form, not `dt / eps`), and `Ca = 1` for lossless cells. Set both.
-- There is no source term: set fields between `execute` calls, every 7 steps or a multiple of 7.
+- Sources: `soft_source` acts at every step (Pulsed runs, below). Adding to E between `execute` calls also works, but
+  it is a 7-step comb.
 - There is no PML: use a graded-loss layer through Ca and Cb.
 - The box is PEC on all six faces, and index 0 is the wall.
-- The state is BF16. Fields go in and out as float32.
+- The state is BF16 by default (`precision="fp16"` or `"fp32"` for more accuracy). Fields go in and out as float32.
 
 `docs/FROM_FDTDZ.md` has the full mapping and a worked example. That mapping has not yet been cross-checked by running
 both codes on the same problem; see Limitations.
@@ -136,9 +139,12 @@ Normal components (Ex on i = 0, and so on) and H are never changed.
 **Arrays.** E, H, Ca and Cb are NumPy arrays of shape `(3, sx, sy, sz)`: the x, y, z component first, z the fastest
 axis. Single components (`Ex` ... `Cbz`) are `(sx, sy, sz)`. Accepted element types:
 
-- `float32`, rounded to BF16 on `set` (to nearest, ties to even);
+- `float32`, rounded to the plan's precision on `set` (to nearest, ties to even);
+- `float16`, IEEE half values (exact in an FP16 plan);
 - `uint16`, BF16 bit patterns;
 - `ml_dtypes.bfloat16`.
+
+The plan's own type (BF16, `float16` or `float32`) round-trips exactly; the others are converted.
 
 Anything else raises `TypeError`; for `float64`, use `.astype(np.float32)`. Views, strides and broadcasts are passed
 without copies, so `np.broadcast_to(np.float32(1), (3, nx, ny, nz))` costs one value. `set` without `offset=` must
@@ -209,8 +215,9 @@ link. Setting a whole host-memory domain from NumPy is slow, so set coefficients
 ## Several GPUs
 
 Use `Plan(shape, ngpus=4)`, or `devices=[...]` to name the CUDA devices. The GPUs must be one model with peer access
-between them. The domain is cut along y. In GPU memory, each GPU needs at least two 24-cell rows, so
-`ny > 24 (2n - 1)` for n GPUs. Host memory works on several GPUs too. Results are bit-identical to one GPU.
+between them. BF16 and FP16 plans cut the domain along y: in GPU memory each GPU needs at least two 24-cell rows, so
+`ny > 24 (2n - 1)` for n GPUs. FP32 plans cut it along x, at least 2 planes per GPU. Host memory works on several GPUs
+too (BF16, FP16). Results are bit-identical to one GPU.
 
 **Other GPU users in the process.** alpha-fdtd plans with the GPU memory that is free when the plan is created. JAX
 reserves most of the GPU by default, which silently moves the domain to host memory or makes the plan fail. Set
@@ -218,6 +225,59 @@ reserves most of the GPU by default, which silently moves the domain to host mem
 
 **Long runs and Ctrl-C.** A call cannot be interrupted until it returns. Run long simulations as a loop of shorter
 `execute` calls; that loop is also where progress reports go.
+
+## Precision: BF16, FP16 or FP32
+
+`Plan(shape, precision="bf16")` is the default. Two other precisions compute the same update:
+
+| precision | state | accuracy (compared with float64 in our tests) | speed and memory |
+|---|---|---|---|
+| `"bf16"` | bfloat16: 8-bit significand, the range of float32 | the reference point | the fast path |
+| `"fp16"` | IEEE half: 11-bit significand | about 8 times closer than BF16 | the same as BF16 |
+| `"fp32"` | float | about 10,000 to 100,000 times closer than BF16 | 48 bytes per cell, GPU memory only, about an order of magnitude slower |
+
+FP16 is the same engine with IEEE half arithmetic. Its catch is range: magnitudes above 65504 become infinity, and values
+below about 6e-5 lose precision until they reach 0 near 3e-8. Scale fields and sources to about 1. In long runs
+(resonators ringing for tens of thousands of steps), BF16 and FP16 dephase where FP32 does not. Every precision is
+bit-identical to the reference kernel in that precision, and recorders, sources and the DFT work in all three. Pass
+`numpy.float16` arrays to set and get FP16 values exactly. `af.bytes_needed(shape, precision=...)` gives the memory.
+
+## Pulsed runs: sources, recording and the DFT
+
+Excite with a short broadband pulse, record a region of the domain in time while the steps run, and Fourier-transform the
+record at the end. One run gives the fields at any number of frequencies:
+
+```python
+import numpy as np, alpha_fdtd as af
+
+n, dt, w0 = 128, 0.5, 2 * np.pi / 16                 # 128^3 vacuum cells; centre wavelength 16 cells
+pulse = lambda k: np.sin(w0 * dt * (k - 150)) * np.exp(-((k - 150) / 50.0) ** 2)
+dipole = np.zeros((3, 1, 1, 1), np.float32)
+dipole[2] = 1.0                                      # Ez at one cell
+with af.Plan((n, n, n)) as plan:
+    plan.set(Ca=np.broadcast_to(np.float32(1), (3, n, n, n)), Cb=np.broadcast_to(np.float32(dt * dt), (3, n, n, n)))
+    src = af.soft_source(plan, (64, 64, 64), E=dipole, waveform=pulse, stop=300)   # acts at every step
+    rec = plan.record((80, 32, 32), (16, 64, 64), every=7, path="run.afr")       # E and H of the box every 7 steps
+    plan.execute(2100)
+    rec.close()
+omega = np.linspace(0.5, 1.5, 200) * w0 * dt         # radians per step
+X = af.dft("run.afr", omega)                         # (200, 6, 16, 64, 64) complex64, computed on a GPU
+```
+
+- **Recording costs no SM time and no extra pass.** Frames are copied by the GPUs' copy engines inside each `execute`,
+  in the window between the pass that writes the box and the next one. They go to a file (large parallel writes, O_DIRECT)
+  or a callback. The cost is the host link and the disk: a frame is 12 bytes per cell of the box. If the link or the disk
+  cannot keep up, the steps slow to their pace.
+- **The DFT reads the file once**, at any set of frequencies, on one GPU. It writes to an array or a `.npy` file larger
+  than host memory.
+- **`soft_source` is a per-step source on the fast path.** The source's effect over each pass of 7 steps is added at the
+  end of the pass, computed once from the plan's coefficients. In exact arithmetic this is the per-step source; adding to E
+  between `execute(7)` calls instead is a comb whose images alias onto recorded spectra.
+- Sampling every `every` steps resolves `|omega| < pi / every` radians per step: `every = 7` resolves vacuum wavelengths
+  down to 7 cells at dt = 0.5.
+
+`docs/RECORDING.md` has the details: data rates, choosing `every`, sizing the disk, the DFT, sources, and the C API
+(`alpha_fdtd.h` sections 7 and 8).
 
 ## Supported GPUs
 
@@ -227,9 +287,11 @@ refused with `Unsupported`. To time a plan on your own GPUs, build with `-DAFDTD
 
 ## Limitations
 
-- One update only: lossy Yee in BF16 (8 bits of precision) with per-cell Ca and Cb, the absorbed H form, a closed PEC
-  box. No PML, no source term, no dispersion, no periodic boundary, no magnetic materials.
-- At least 16 cells per axis. On several GPUs in GPU memory, `ny > 24 (2n - 1)`.
+- One update only: lossy Yee in BF16, FP16 or FP32 with per-cell Ca and Cb, the absorbed H form, a closed PEC
+  box. No PML, no dispersion, no periodic boundary, no magnetic materials. Sources are injectors (`soft_source`).
+- Recorders and injectors need the domain in GPU memory. FP32 plans need it in GPU memory, and are cut along x on
+  several GPUs.
+- At least 16 cells per axis. On several GPUs in GPU memory, `ny > 24 (2n - 1)` (BF16, FP16) or `nx >= 2n` (FP32).
 - `steps % 7` of each call run on a slow tail path: use multiples of 7.
 - Linux x86_64 and NVIDIA GPUs of compute capability 8.0, 9.0, 10.0 and 10.3 only; no CPU fallback.
 - A call cannot be interrupted with Ctrl-C until it returns.
@@ -250,13 +312,26 @@ The tests cover:
 - `estimate`, `measure` and `patient` plans;
 - non-finite data;
 - strided, transposed and broadcast arrays, and sub-boxes;
-- the wall rule and its counts, error paths, and wisdom round trips.
+- the wall rule and its counts, error paths, and wisdom round trips;
+- recorders: every frame of every recorder against the oracle's state at its step, over the whole box. This covers boxes
+  on domain edges, the whole domain, several boxes at once, unaligned splits, calls of more than 256 passes, forced
+  schedules, one slot, file sinks read back, and two GPUs across the seam. Recording must not change the state;
+- injectors: the rule of `alpha_fdtd.h` section 8 against the oracle, on the walls, with frames, over several launches
+  and across the seam. `soft_source` is checked against a float64 per-step source;
+- the DFT against a float64 NumPy DFT of the same frames, also when the work is split;
+- FP16 and FP32 plans against the oracle in that precision: the exact, recorder and injector tests above, in GPU and
+  host memory (FP16) and on 2 GPUs. FP16 conversions are checked against NumPy's float16 rounding.
 
-Two negative controls check the harness itself: one flipped bit must give exactly one mismatch, and an oracle run one
-step longer must mismatch.
+Negative controls check the harness itself:
+- one flipped bit must give exactly one mismatch;
+- an oracle run one step longer must mismatch;
+- frames compared one step late must mismatch;
+- an oracle that leaves out one injection must mismatch.
 
-Before release, the full suite passed with 0 mismatches on H100 x1, A100-SXM4-80GB x1 and H100 x2. An earlier release
-candidate passed on B300 x1 as well. Large cases were checked separately against the reference checksums over the whole
+For 0.2.0, the full suite passed with 0 mismatches on H100 x1 and x2. The recorder, injector and DFT tests also passed
+on A100-SXM4-80GB, H200 and B300. So did randomized stress tests: up to 1338 x 1344 x 1336, with up to 10 recorders and
+hundreds of injections, every frame compared with a replay. For 0.1.0, the full suite passed on H100 x1, A100-SXM4-80GB
+x1 and H100 x2, and an earlier release candidate passed on B300 x1 as well. Large cases were checked separately against the reference checksums over the whole
 domain: 1338 x 1344 x 1336 on H100 and B300, 1380^3 on A100, and 2746 x 2880 x 2600 on 8 x H100. The 8-GPU, A100 and
 B300 checks ran on the release candidate.
 
@@ -290,7 +365,8 @@ and threads. `docs/API.md` lists every C function with its Python counterpart. I
 | `WallWarning`, `CoefficientWarning` | (Python only) |
 
 `ALPHA_FDTD_LIBRARY=/path/to/libalphafdtd.so` makes `import alpha_fdtd` load that library instead of the one inside the
-package, for development builds. It is the only environment variable alpha-fdtd reads.
+package, for development builds. It is the only environment variable alpha-fdtd reads, apart from CUDA's
+`CUDA_LAUNCH_BLOCKING`: with it set, recorders and injectors end each launch at their steps instead of working inside it.
 
 Design notes are in `docs/ARCHITECTURE.md`, and what sets the speed is in `docs/PERFORMANCE.md`.
 

@@ -8,13 +8,16 @@
 //   plane zi at zi PS, then (gp 30 + l) kCREC bytes; lanes 24..29 of row J repeat lanes 0..5 of row J + 1.  Every value outside the
 //   owned domain is +0.
 #pragma once
+#include <algorithm>
 #include <cstddef>
+#include <mutex>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <functional>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 
 namespace afdtd {
 
@@ -38,6 +41,16 @@ struct Driver {
   decltype(&::cuStreamWaitValue32) StreamWaitValue32;     // may be NULL (the host-memory executor then serialises its launches)
 };
 const Driver& drv();
+// Plans that share a GPU take turns: each API call holds its GPUs' locks (api.cpp), taken in ascending device order.  While a
+// launch with recorders or injectors runs, the calling thread must keep enqueuing work; a call that frees memory or loads a module
+// on that GPU from another thread blocks those enqueues until the GPU is idle, which it never is.
+std::recursive_mutex& device_lock(int dev);
+struct DeviceLocks {
+  std::vector<int> d;
+  explicit DeviceLocks(std::vector<int> devs) : d(std::move(devs)) { std::sort(d.begin(), d.end()); for (int x : d) device_lock(x).lock(); }
+  ~DeviceLocks() { for (auto it = d.rbegin(); it != d.rend(); ++it) device_lock(*it).unlock(); }
+  DeviceLocks(const DeviceLocks&) = delete; DeviceLocks& operator=(const DeviceLocks&) = delete;
+};
 
 struct Geo {                     // engine geometry of an nx * ny * nz domain
   int nx, ny, nz, NI, NJ, NB, NZP, NPAIR;
@@ -69,6 +82,23 @@ struct HostDomain {              // the domain in pinned host memory, one record
   size_t RSB = 0, CSB = 0, CROW = 0, HRS = 0, bytes = 0;
 };
 
+// Agent work: host-enqueued GPU work on the state at 7-step boundaries inside a persistent launch (recorders' copies, injectors'
+// adds), on one non-blocking stream per GPU.  The engine waits for the pass that produces the state, runs the work, and holds back
+// the blocks of the next pass that would overwrite (or, for writes, read) the region.  Regions are in rows of kS y cells and x pairs.
+struct Region { int J0, J1, q0, q1; bool write; };        // rows [J0, J1), pairs [q0, q1) (pair q: x = 2q, 2q + 1), all z
+struct AgentDev {                       // device g owns rows [Ja, Jb) (16-bit engine) or x planes [Xa, Xb) (FP32: dense arrays at fld)
+  int g, dev, Ja, Jb; char* fld; long ROWREC, PLREC; cudaStream_t st;
+  int prec = 0; int64_t nx = 0, ny = 0, nz = 0; int Xa = 0, Xb = 0;
+};
+struct AgentHooks {
+  std::function<bool(int64_t t)> want;                                 // work on the state at plan step t (t % 7 == 0)?
+  std::function<void(int64_t t, std::vector<Region>& out)> regions;    // what that work touches (no side effects)
+  std::function<void(int64_t t)> begin;                                // before the work at t is enqueued (may block: back-pressure)
+  std::function<void(int64_t t, const AgentDev& d, int q0, int q1)> work;   // enqueue device d.g's part (its rows only, copies of x
+                                                                       // pairs [q0, q1) only; writes all) on d.st
+  std::function<void(int64_t t)> end;                                  // after every device's part at t is enqueued
+};
+
 // One kernel text compiled for one architecture (object.cu).
 struct Object {
   const char* name;              // kernel text, e.g. "zs7_tma"
@@ -79,16 +109,20 @@ struct Object {
   void (*destroy)(void* st);
   void (*set_knobs)(void* st, const Knobs& k);     // reallocates the pools when k.mx changes
   void (*box)(void* st, const int64_t off[3], const int64_t shape[3], uint16_t* const comp[12], int dir);  // 0 in, 1 out; dense BF16
-  double (*advance)(void* st, int64_t passes);     // passes * 7 steps; returns seconds
+  double (*advance)(void* st, int64_t passes, int64_t step0, const AgentHooks* h);   // passes * 7 steps from plan step step0; seconds
+  void (*agents_now)(void* st, int64_t t, const AgentHooks& h);                      // the work at t on the state as it is (synchronous)
   void (*tail)(void* st, int steps);               // single reference steps
   void (*checksums)(void* st, uint64_t out[6]);
   void (*zero)(void* st);                          // every value +0
   // domain in host memory
   double (*host_run)(HostDomain& h, int passes, int Q);
   void (*host_tail)(HostDomain& h, int steps);
+  int prec;                                        // the state's element type: AFDTD_BF16, AFDTD_F16 or AFDTD_F32
 };
 
-const std::vector<const Object*>& objects();       // every object linked into the library
+const std::vector<const Object*>& objects();       // every object linked into the library (the 16-bit engines)
+extern const Object kF32Object;                    // f32.cu: the FP32 executor, every architecture
+size_t f32_bytes(int64_t nx, int64_t ny, int64_t nz, int ngpus);   // its GPU memory, busiest GPU
 
 // Host-memory ring rule (the executor's): ring_bad > 0 means the ring of NR rows is too small for depth Q.
 long ring_bad(int Q, int NR, int NI, int NJ, int ngpus, int passes, double lam, int grid);
@@ -96,13 +130,17 @@ long ring_bad(int Q, int NR, int NI, int NJ, int ngpus, int passes, double lam, 
 }  // namespace afdtd
 
 // ================================================================================================ the plan (host code)
+#include <memory>
 #include <mutex>
 namespace afdtd {
+struct Recorder;                         // record.cpp
+struct Injector;                         // inject.cu
 struct Plan {
   int64_t n[3] = {0, 0, 0};
   std::vector<int> devs;
   unsigned flags = 0;
   int rigor = 0, from_wisdom = 0, on_host = 0, cc = 0, nsm = 0, small_pools = 0;
+  int prec = 1;                          // the state's element type: AFDTD_BF16 (1), AFDTD_F32 (2) or AFDTD_F16 (3)
   std::string gpu_name, sched;   // device name; schedule as in its wisdom record
   const Object* obj = nullptr;
   Knobs knobs; void* mem = nullptr;      // domain in GPU memory
@@ -113,17 +151,46 @@ struct Plan {
   uint64_t wz_coef = 0, wz_field = 0;
   bool broken = false;
   std::mutex mu;
+  std::vector<std::shared_ptr<Recorder>> rec;   // recorders, by id (null once closed); shared_ptr: Recorder is opaque here
+  std::vector<std::shared_ptr<Injector>> inj;   // injectors, by id (null once closed)
 };
 Plan* plan_create(int64_t nx, int64_t ny, int64_t nz, int ngpus, const int* devices, size_t host_budget, int rigor, unsigned flags);
 void plan_destroy(Plan* p);
 void plan_execute(Plan& p, int64_t steps);
 void plan_checksums(Plan& p, uint64_t out[6]);
-void bytes_needed(int64_t nx, int64_t ny, int64_t nz, int ngpus, size_t* gpu, size_t* host);
+void bytes_needed(int64_t nx, int64_t ny, int64_t nz, int ngpus, size_t* gpu, size_t* host, unsigned flags = 0);
 std::string plan_describe(const Plan& p);
+// record.cpp: recorders (frames of a box at every multiple of `every` steps, to a file or a callback)
+struct RecOptions { int64_t off[3], shape[3], every; std::string path; int (*cb)(void*, int64_t, const void*, size_t); void* user; int slots; };
+struct RecInfo { int64_t off[3], shape[3], every, row0, rows, z0, planes, pair0, pairs, first_step, frames; size_t frame_bytes, frame_stride, host_bytes;
+                 double stall_s, sink_s, copy_s; int dtype; };
+int record_open(Plan& p, const RecOptions& o);             // id
+void record_info(Plan& p, int id, RecInfo& out);
+void record_flush(Plan& p, int id);                        // every frame so far delivered to the sink
+void record_close(Plan& p, int id);
+void record_close_all(Plan& p) noexcept;
+bool record_active(const Plan& p);
+AgentHooks record_hooks(Plan& p);                          // the recorders' work at 7-step boundaries
+std::string record_take_error(Plan& p);                    // the recorders' sink failures since the last call ("" if none)
+bool in_recorder_thread();                                 // the calling thread runs recorder callbacks
+// inject.cu: injectors (state += sum_j w[k][j] G_j at the steps first + 7 k)
+struct InjOptions { int64_t off[3], shape[3], first, nrows; int M; const float* basis; const float* weights; };
+int inject_open(Plan& p, const InjOptions& o);
+void inject_close(Plan& p, int id);
+void inject_close_all(Plan& p) noexcept;
+bool inject_active(const Plan& p);
+bool inject_due_between(const Plan& p, int64_t t0, int64_t t1);   // an injection at a step in [t0, t1]
+AgentHooks inject_hooks(Plan& p);
+// dft.cu: the DFT of a recording file (afdtd_dft)
+void dft_file(const char* path, const double* omega, int nfreq, unsigned comps, int device, size_t gpu_bytes, float* out, const char* out_path);
 // boxio.cpp
 struct BoxSpec { int64_t off[3], shape[3]; unsigned flags; struct { void* data; int dtype; int64_t stride[3]; } a[12]; };
 void box_io(Plan& p, const BoxSpec& b, int dir);           // set (0, lower-wall rule applied) or get (1); checks first
 void host_alloc(HostDomain& h);                            // allocate and pin h.bytes, every value +0
+uint16_t f32_to_f16(uint32_t f32bits);                   // IEEE half, round to nearest even (boxio.cpp)
+uint32_t f16_to_f32(uint16_t h);                           // exact
+void* pinned_alloc(size_t bytes);                          // pinned (portable), huge pages, zeroed; NULL on failure
+void pinned_free(void* p) noexcept;
 void host_free(HostDomain& h);
 void host_checksums(const HostDomain& h, uint64_t out[6]);
 void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& f);   // [begin, end) chunks on the CPU threads

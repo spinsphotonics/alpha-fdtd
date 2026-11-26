@@ -32,6 +32,7 @@
 #define SCREC 24
 #define SDUP 1
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda.h>
 #define SPM 1
 #define SXGS 2176
@@ -41,7 +42,11 @@
 #define SM80 1
 #define SNPW 0
 #define SPW 3
+#ifdef AFDTD_FP16
+typedef __half2 T;                // the FP16 engine: the same text in IEEE half precision
+#else
 typedef __nv_bfloat162 T;
+#endif
 typedef unsigned long long u64;
 struct __align__(16) V4 { unsigned a, b, c, d; };
 struct __align__(16) Rec { V4 v[3]; };

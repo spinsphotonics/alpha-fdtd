@@ -41,8 +41,8 @@ int main(int argc, char** argv)
   char text[1024];
 
   /* version, error text */
-  check(!strcmp(afdtd_version(), "0.1.0"), "afdtd_version");
-  check(AFDTD_API_VERSION == 1, "AFDTD_API_VERSION");
+  check(!strcmp(afdtd_version(), "0.2.0"), "afdtd_version");
+  check(AFDTD_API_VERSION == 2, "AFDTD_API_VERSION");
   check(afdtd_bytes_needed(16, 16, 16, 1, &g1, &h1) == AFDTD_OK && !strcmp(afdtd_last_error(), ""), "error text empty after a success");
 
   /* memory sizes */

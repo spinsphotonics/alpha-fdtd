@@ -19,7 +19,7 @@ def run(args, cwd):
     return r.stdout
 
 
-@pytest.mark.parametrize("name", ["quickstart.py", "coefficients.py", "from_fdtdz.py", "offload.py", "wisdom.py"])
+@pytest.mark.parametrize("name", ["quickstart.py", "coefficients.py", "from_fdtdz.py", "offload.py", "wisdom.py", "pulse.py"])
 def test_example(name, tmp_path):
     out = run([os.path.join(EXAMPLES, name)], tmp_path)
     if name == "wisdom.py":

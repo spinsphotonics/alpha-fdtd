@@ -4,8 +4,9 @@
 time step, a source (field pattern, waveform, position), an absorption mask, z-PML parameters and a list of output
 steps, and returns E at those steps. alpha-fdtd is a different kind of tool. It keeps a state that you step and
 read, it targets domains fdtdz cannot hold (fdtdz's z extent is fixed by its warp layout, and it runs on one GPU),
-and it computes one update only: lossy Yee in BF16, per-cell Ca and Cb, closed PEC box. There is no PML, no source
-term and no dispersion. A full worked example is in `examples/from_fdtdz.py`.
+and it computes one update only: lossy Yee in BF16, per-cell Ca and Cb, closed PEC box. There is no PML and no
+dispersion; sources are injectors (`soft_source`), and output steps can be a recorder. A full worked example is in
+`examples/from_fdtdz.py`.
 
 > **Not yet cross-checked.** The fdtdz side of this page comes from reading fdtdz's source at a 2023 commit. Nobody
 > has yet run both codes on the same small vacuum problem. Until someone does, three points are open: whether
@@ -19,10 +20,10 @@ term and no dispersion. A full worked example is in `examples/from_fdtdz.py`.
 | `dt` | `C_H`. Use `dt = 0.5`: it is below the 3-D Courant limit of 1/sqrt(3), and as a power of two it makes the absorbed form bit-identical to the textbook one |
 | absorption mask near the x-y edges | Per-cell loss through Ca and Cb. With conductivity `s`, `Ca = (1 - s dt / 2 eps) / (1 + s dt / 2 eps)` and `Cb = (dt * dt / eps) / (1 + s dt / 2 eps)` (`examples/coefficients.py`). Grade `s` towards the walls to make an absorber |
 | PML (z only) | None. Use a graded-loss layer, as above, thick enough for your reflection target |
-| source field, waveform, position | No source term. Either set initial fields before the first `execute`, or step in chunks and add the source between them: `get` the plane, add to it, then `set` it back with `offset=` |
-| per-step soft source | Inject every 7 steps, or every multiple of 7. `execute(1)` per step runs on the slow tail path and adds a host round trip each step |
+| source field, waveform, position | `af.soft_source(plan, offset, E=pattern, waveform=s, stop=...)`: the pattern times s(n) is added to E at every step n, on the fast path (`docs/RECORDING.md`). Alternatively set initial fields, or step in chunks and add the source between them: `get` the plane, add to it, then `set` it back with `offset=` |
+| per-step soft source | `soft_source` (exact pass-level timing). Adding between `execute(7)` calls is a 7-step comb: its images alias onto recorded spectra |
 | `output_steps` and E snapshots | `for ...: plan.execute(interval); plan.get("E")`. `get` takes any box, so reading a slice moves only that slice's bytes |
-| fp16 or fp32 state | BF16 state: 8 bits of precision, float32 range. Fields go in and out as float32 and the library converts them |
+| fp16 or fp32 state | BF16 state by default (8 bits of precision, float32 range); `precision="fp16"` or `"fp32"` for more accuracy (README, Precision). Fields go in and out as float32 and the library converts them |
 | H not exposed | H is part of the state, at time `n - 1/2` after `n` steps: `H = dt * plan.get("H")` |
 | one GPU, z fixed by the warp layout | 1 to 8 GPUs (`ngpus=`, `devices=`), at least 16 cells per axis, and host memory beyond the GPUs (`host_bytes=`, sized with `af.bytes_needed`) |
 | PML in z, absorber in x-y | A closed PEC box on all six faces. Index 0 is the wall, so put sources at index 1 or more |

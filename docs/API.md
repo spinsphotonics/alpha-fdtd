@@ -1,7 +1,8 @@
-# API reference (v1)
+# API reference (API 2)
 
 This page is written from `include/alpha_fdtd.h`, which is normative; where they differ, the header wins. API v1 is
-frozen: functions, structs and constants keep their meaning and layout, and a later API only adds functions.
+frozen: functions, structs and constants keep their meaning and layout, and a later API only adds functions. API 2
+(0.2.0) adds recording, the DFT and injectors (header sections 7 and 8; below, Recording and Injectors).
 
 Each C function has one Python counterpart in `alpha_fdtd`, and each Python method makes one C call (`Plan.set` also
 reads `afdtd_plan_info` once, to raise `WallWarning`).
@@ -26,7 +27,7 @@ reads `afdtd_plan_info` once, to raise `WallWarning`).
 | `AFDTD_EUNSUPPORTED` (-4) | no GPU, an unsupported GPU, or no peer access between the GPUs | `Unsupported` |
 | `AFDTD_EDEVICE` (-5) | a CUDA failure, or a host-memory launch that made no progress for 120 s; the plan is unusable, destroy it | `DeviceError` |
 | `AFDTD_EWALLS` (-6) | `AFDTD_STRICT_WALLS` and E breaks the lower-wall rule; nothing written | `WallError` (also a `ValueError`) |
-| `AFDTD_EIO` (-7) | a wisdom file could not be read or written | `WisdomIOError` (also an `OSError`) |
+| `AFDTD_EIO` (-7) | a wisdom file, a recording or a DFT output could not be read or written; or a recorder's sink failed (the steps ran) | `WisdomIOError` = `FileIOError` (also an `OSError`) |
 | `AFDTD_EINTERNAL` (-8) | a self-check failed or an internal invariant broke; please report it | `InternalError` |
 
 Python also raises `TypeError` for an unsupported element type or a non-integer argument, and `ValueError` for shapes
@@ -50,16 +51,16 @@ This plans an `nx * ny * nz` domain and allocates its state, with every value +0
 
 | field | Python | meaning |
 |---|---|---|
-| `ngpus` | `ngpus=` | 1 to 8; 0 means 1. The domain is cut along y. |
+| `ngpus` | `ngpus=` | 1 to 8; 0 means 1. The domain is cut along y (BF16, FP16) or x (FP32). |
 | `devices` | `devices=` | `ngpus` distinct CUDA ordinals, of one GPU model with peer access between them; NULL means `0 .. ngpus-1`. |
 | `host_bytes` | `host_bytes=` | host memory the plan may pin when the domain does not fit on the GPUs; 0 means GPU memory only. |
 | `rigor` | `rigor=` | `AFDTD_ESTIMATE` (0), `AFDTD_MEASURE` (1), `AFDTD_PATIENT` (2), `AFDTD_WISDOM_ONLY` (3); in Python `"estimate"`, `"measure"`, `"patient"`, `"wisdom_only"`. |
-| `flags` | `force_host=`, `strict_walls=` | `AFDTD_FORCE_HOST` keeps the domain in host memory; `AFDTD_STRICT_WALLS` makes `set` refuse E on the lower wall. Other bits are refused. |
+| `flags` | `force_host=`, `strict_walls=`, `precision=` | `AFDTD_FORCE_HOST` keeps the domain in host memory; `AFDTD_STRICT_WALLS` makes `set` refuse E on the lower wall; `AFDTD_FP16` or `AFDTD_FP32` (API 2; Python `precision="fp16"` / `"fp32"`, default `"bf16"`) choose the state's precision (header section 1). FP32 plans keep the domain in GPU memory and cut it along x on several GPUs. Other bits are refused. |
 
 Requirements and timing:
 
 - Each axis needs at least 16 cells.
-- On n > 1 GPUs in GPU memory, `ny > 24 (2n - 1)`.
+- On n > 1 GPUs in GPU memory, `ny > 24 (2n - 1)` for BF16 and FP16 plans, `nx >= 2n` for FP32 plans.
 - `MEASURE` and `PATIENT` take seconds to minutes, and so does the first touch of a large host domain.
 - Any rigor uses a wisdom record of equal or higher rigor for the same problem.
 
@@ -79,11 +80,15 @@ more than once, and any later method raises `ValueError("plan is closed")`.
 
 ```c
 int afdtd_bytes_needed(int64_t nx, int64_t ny, int64_t nz, int ngpus, size_t* gpu_bytes, size_t* host_bytes);
+int afdtd_bytes_needed2(int64_t nx, int64_t ny, int64_t nz, int ngpus, unsigned flags, size_t* gpu_bytes, size_t* host_bytes);  /* API 2 */
 ```
 
 ```
-bytes_needed(shape, ngpus=1) -> (gpu_bytes, host_bytes)
+bytes_needed(shape, ngpus=1, precision="bf16") -> (gpu_bytes, host_bytes)
 ```
+
+`afdtd_bytes_needed2` takes the plan flags, for the precision. An FP32 plan needs about 48 bytes per cell on the GPUs and
+cannot use host memory (`host_bytes` is 0).
 
 This works without a GPU and without planning. It returns two numbers:
 
@@ -117,8 +122,11 @@ skipped.
 
 **Element types.** Each component has its own:
 
-- `AFDTD_BF16` (1) is `uint16_t` BF16 bit patterns, the stored format.
-- `AFDTD_F32` (2) is `float`. It is rounded to nearest even on set and widened exactly on get.
+- `AFDTD_BF16` (1) is `uint16_t` BF16 bit patterns.
+- `AFDTD_F32` (2) is `float`.
+- `AFDTD_F16` (3, API 2; Python `numpy.float16`) is `uint16_t` IEEE half bit patterns.
+- The plan's own type (`afdtd_plan_precision`; Python `Plan.precision`) round-trips exactly. The others are converted
+  through float32, rounding to nearest even where they narrow; FP16 overflows to infinity.
 - 0 is refused.
 
 **Layout.**
@@ -141,7 +149,7 @@ skipped.
 - One call is one atomic `afdtd_set`, and all its arrays cover the same box.
 - Without `offset=`, every array must cover the whole domain.
 - Arrays go in by pointer and element strides, with no copies, so `np.broadcast_to` becomes zero strides.
-- Accepted types are `float32`, `uint16` (bit patterns) and `ml_dtypes.bfloat16`.
+- Accepted types are `float32`, `float16`, `uint16` (BF16 bit patterns) and `ml_dtypes.bfloat16`.
 - E on the lower wall raises `WallWarning`, or `WallError` under `strict_walls=True`.
 
 **Python, `get`.**
@@ -247,22 +255,85 @@ and the schedule chosen for it, with its rigor and measured rate.
 
 The wisdom functions are serialised by one library-wide lock.
 
+## Recording
+
+```c
+int afdtd_record(afdtd_plan p, const afdtd_recorder_options* o);   /* id >= 0 */
+int afdtd_record_info(afdtd_plan p, int id, afdtd_recorder_info* out);
+int afdtd_record_flush(afdtd_plan p, int id);
+int afdtd_record_close(afdtd_plan p, int id);
+int afdtd_dft(const char* path, const double* omega, int nfreq, unsigned components, int device, size_t gpu_bytes,
+              float* out, const char* out_path);
+```
+
+```
+Plan.record(offset, shape, every, path=None, *, callback=None, slots=0) -> Recorder
+Recorder.info -> RecorderInfo;  Recorder.flush();  Recorder.close();  Recorder.frames, Recorder.get(k, components)
+Recording(path): .header, .steps, .get(k, components), .dft(omega, ...), len()
+dft(path, omega, components="EH", *, device=0, gpu_bytes=0, out=None, out_path=None) -> complex64 array or None
+```
+
+A recorder copies E and H of a box at every step that is a multiple of `every` (a multiple of 7), while `execute` runs.
+
+| option | Python | meaning |
+|---|---|---|
+| `offset`, `shape` | `offset`, `shape` | the box |
+| `every` | `every` | steps between frames, a multiple of 7 |
+| `path` | `path` | write the frames to this file |
+| `callback`, `user` | `callback=` (gets a `FrameView`) | or hand each frame to this function, on a library thread, in step order; nonzero (Python: an exception) reports a failure |
+| (neither) | `Recorder.frames` | Python only: frames kept in host memory |
+| `slots` | `slots=` | pinned host buffers of one frame (0 = 3) |
+
+`afdtd_recorder_info` gives the frame layout (`row0 ... pairs`, header section 7), `frame_bytes`, `frame_stride`,
+`first_step`, `frames`, `host_bytes` (pinned), `stall_s` (time `execute` waited for the sink with the frame already in
+host memory) and `sink_s` (time writing or in the callback). Frames reach the sink after `execute` returns; `flush` and
+`close` wait for them. A sink failure drops the frames after it and is reported as `AFDTD_EIO` by `execute`, `flush` or
+`close`; the steps still run.
+
+`afdtd_dft` reads a recording file and writes `out[f][c][x][y][z] = sum_k v_c(k) exp(-i omega_f tau_c(k))`, complex float,
+for the components set in `components` (bits `1 << AFDTD_EX` ... `1 << AFDTD_HZ`), or a `.npy` file at `out_path`.
+`tau` is the frame's step for E and the step minus 1/2 for H. It needs no plan.
+
+## Injectors
+
+```c
+int afdtd_inject(afdtd_plan p, const afdtd_injector_options* o);   /* id >= 0 */
+int afdtd_inject_close(afdtd_plan p, int id);
+```
+
+```
+Plan.inject(offset, basis, first_step, weights) -> Injector;  Injector.close()
+soft_source(plan, offset, E=None, H=None, *, waveform, waveform_h=None, start=None, stop, margin=8) -> Injector
+```
+
+After each step `first_step + 7 k` whose weight row k is not all zero, the injector adds `sum_j weights[k][j] * basis[j]`
+to E and H over its box, in float32, rounded to BF16 (the exact rule is header section 8). `basis` is
+`(nbasis, 6, sx, sy, sz)` float32, `weights` is `(rows, nbasis)`; both are copied. `soft_source` builds them from a profile
+and a waveform so that the result is a source acting at every step (`docs/RECORDING.md`).
+
 ## Miscellaneous
 
 | C | Python | |
 |---|---|---|
 | `void afdtd_free(void*)` | (internal) | frees memory returned by the library |
-| `const char* afdtd_version(void)` | `version()`, `__version__` | `"0.1.0"`; the Python import checks that the two agree |
+| `const char* afdtd_version(void)` | `version()`, `__version__` | `"0.2.0"`; the Python import checks that the two agree |
 | `const char* afdtd_last_error(void)` | the exception message | this thread's reason for the last failure; `""` after a success; never NULL |
-| `AFDTD_API_VERSION`, `AFDTD_VERSION_*` | | 1; 0.1.0 |
+| `AFDTD_API_VERSION`, `AFDTD_VERSION_*` | | 2; 0.2.0 |
 
 ## Threads and CUDA
 
-- Different plans may be used from different threads at the same time.
+- Different plans may be used from different threads at the same time. Plans that share a GPU take turns, call by call.
 - Calls on the same plan are serialised.
 - Every call is synchronous: when it returns, its GPU work is complete and your buffers may be reused. Python releases
-  the GIL during each call.
+  the GIL during each call. The one exception: a recorder's frames reach its sink (file or callback) from a library
+  thread, after `execute` returns; `afdtd_record_flush` waits for them.
 - The library uses each device's primary context and restores the calling thread's current device.
-- Other CUDA users in the process are fine, but planning uses only the memory that is free at `afdtd_plan_create`. If
-  JAX runs in the same process, set `XLA_PYTHON_CLIENT_PREALLOCATE=false`.
+- Other CUDA users in the process are fine, with one exception: while `execute` runs with a recorder or an injector
+  open, another thread must not free or unregister memory (`cudaFree`, `cudaFreeHost`, `cudaHostUnregister`) or launch
+  a kernel for the first time on the plan's GPUs. Those calls wait for the GPU to be idle while holding up the
+  library's own calls, so the steps never end. Kernels, copies, events and synchronization are fine.
+  `CUDA_MODULE_LOADING=EAGER`, set before CUDA starts, removes the first-launch case (PyTorch, for example, loads
+  kernels lazily).
+- Planning uses only the memory that is free at `afdtd_plan_create`. If JAX runs in the same process, set
+  `XLA_PYTHON_CLIENT_PREALLOCATE=false`.
 - The library is not fork-safe after the first call, as with CUDA.
