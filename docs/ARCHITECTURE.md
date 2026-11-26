@@ -52,7 +52,7 @@ deadlock. A watchdog turns a launch that does not finish within 120 s into `AFDT
 
 ```
 alpha-fdtd-wisdom 1
-kset=<12 hex> gpu="<device name>" cc=9.0 sm=132 ngpus=1 size=1338x1344x1336 mode=gpu rigor=measure rate=3.17e11 sched="obj=zs7_tma grid=132 tx=12 gate=1 mx=1100"
+kset=<12 hex> gpu="<device name>" cc=9.0 sm=132 ngpus=1 size=1338x1344x1336 mode=gpu rigor=measure rate=<cell updates/s> sched="obj=zs7_tma grid=132 tx=12 gate=1 mx=1100"
 ```
 
 `kset` is a hash of the kernel texts and executor sources: a build that changes them ignores old records (they are

@@ -155,7 +155,7 @@ split of the steps.
 
 - `"estimate"` (the default) picks by rules and a cost model, without timing.
 - `"measure"` times 4 to 12 candidates on your GPUs, twice each, for about one second of work per timing. On a large
-  domain that takes tens of seconds (18 s on H100 at 1338 x 1344 x 1336).
+  domain that takes tens of seconds.
 - `"patient"` times more candidates, three times each.
 - `"wisdom_only"` never plans: it uses a saved record or raises `NoPlan`.
 
@@ -203,10 +203,8 @@ A plan uses GPU memory when the domain fits in the GPUs' free memory. Otherwise 
 fits. `plan.info.on_host` tells you which mode was chosen. Results are bit-identical in both modes.
 
 In host memory, each `execute` call streams the whole domain over the host link once per round of up to `7 qmax` steps
-(`plan.describe()` gives `qmax`). Calls that long run near the GPU-memory rate: 0.87 of it, measured on H100. Short
-calls are bound by the host link. On H100, `execute(70)` on a 2.8e9-cell domain ran at 5.6e10 cell updates/s. Setting a
-whole host-memory domain from NumPy runs at about 1 GB/s of state (38 s for 75 GiB), so set coefficients once and set
-fields in boxes.
+(`plan.describe()` gives `qmax`). Calls that long run close to the GPU-memory rate; shorter calls are bound by the host
+link. Setting a whole host-memory domain from NumPy is slow, so set coefficients once and set fields in boxes.
 
 ## Several GPUs
 
@@ -221,24 +219,11 @@ reserves most of the GPU by default, which silently moves the domain to host mem
 **Long runs and Ctrl-C.** A call cannot be interrupted until it returns. Run long simulations as a loop of shorter
 `execute` calls; that loop is also where progress reports go.
 
-## Supported GPUs and measured rates
+## Supported GPUs
 
 Supported: compute capability 8.0 (A100), 9.0 (H100, H200), 10.0 (B200) and 10.3 (B300), in one library. Other GPUs are
-refused with `Unsupported`.
-
-Rates are owned cell updates per second, at 448 steps per call unless stated, with `rigor="measure"`, measured on
-25 Nov 2026 with CUDA 13.3.1. Rows marked RC were measured on the release candidate just before the last fixes. The
-method and details are in `docs/PERFORMANCE.md`.
-
-| GPU | domain | rate |
-|---|---|---|
-| H100 80GB HBM3 (SXM) | 1338 x 1344 x 1336 | 3.19e11 |
-| A100 80GB PCIe (RC) | 1380 x 1380 x 1380 | 1.31e11 |
-| B300 (RC) | 1338 x 1344 x 1336 | 4.66e11 |
-| 8 x H100 (RC) | 2746 x 2880 x 2600 | 2.45e12 |
-| H100, host memory, 385 steps per call (RC) | 1338 x 5760 x 1336 (272 GiB in host memory) | 2.74e11 |
-
-Not measured: H200, B200, A100-SXM, and 2 to 7 GPUs.
+refused with `Unsupported`. To time a plan on your own GPUs, build with `-DAFDTD_BUILD_TOOLS=ON` and run `afdtd_bench`
+(`tools/bench/bench.c`).
 
 ## Limitations
 
@@ -307,7 +292,7 @@ and threads. `docs/API.md` lists every C function with its Python counterpart. I
 `ALPHA_FDTD_LIBRARY=/path/to/libalphafdtd.so` makes `import alpha_fdtd` load that library instead of the one inside the
 package, for development builds. It is the only environment variable alpha-fdtd reads.
 
-Design notes are in `docs/ARCHITECTURE.md`, and the performance model and measurements are in `docs/PERFORMANCE.md`.
+Design notes are in `docs/ARCHITECTURE.md`, and what sets the speed is in `docs/PERFORMANCE.md`.
 
 ## Contributing
 

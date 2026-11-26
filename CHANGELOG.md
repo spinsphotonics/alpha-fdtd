@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## Unreleased
+
+- Docs: measured rates removed from README.md and docs/PERFORMANCE.md; `afdtd_bench` (`tools/bench`) times a plan
+  on your own GPUs.
+
+## 0.1.0 (2026-11-25)
 
 First release. C library `libalphafdtd` (API v1, `include/alpha_fdtd.h`) and the Python package `alpha_fdtd`.
 

@@ -19,5 +19,4 @@ compute warps). Every transform is a text rewrite asserted to apply exactly; the
 Only the code paths that the configurations in `gen.py` reach are kept.
 
 The committed texts differ from the texts whose speed and exactness were first measured only in comments (the code
-lines, comments removed, are identical); speed and bit-identity of the shipped build are checked by the GPU tests and
-`docs/PERFORMANCE.md`.
+lines, comments removed, are identical); bit-identity of the shipped build is checked by the GPU tests.

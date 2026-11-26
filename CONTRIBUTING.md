@@ -19,8 +19,8 @@ pip install .[test] && pytest tests/python
   them fail is not accepted.
 - **Kernels.** `src/kernels/*.cuh` are generated. Change them only through `tools/gen` and commit the result;
   `python3 tools/gen/gen.py --check` (the `kernels_generated` test) must pass.
-- **Performance.** Report speed changes with numbers measured on the same machine before and after, in the format of
-  `docs/PERFORMANCE.md`. Never fill in a number that was not measured.
+- **Performance.** Report speed changes with numbers measured on the same machine before and after (`tools/bench`).
+  Never fill in a number that was not measured.
 - **API.** `include/alpha_fdtd.h` is API v1: functions, structs and constants do not change meaning or layout
   (`tests/data/api_v1.txt` checks the layout). New features are new functions.
 - Every source file starts with `SPDX-License-Identifier: MIT`. Contributions are under the MIT license.
